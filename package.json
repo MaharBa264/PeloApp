@@ -1,0 +1,13 @@
+{
+  "name": "peloapp", "version": "0.1.0", "private": true, "type": "module",
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "check": "node --check src/worker.js && node --check public/app.js && npm test",
+    "dev": "npx wrangler@4 dev --env dev",
+    "db:local": "npx wrangler@4 d1 migrations apply PeloApp-dev --local --env dev",
+    "db:prod": "npx wrangler@4 d1 migrations apply PeloApp-prod --remote",
+    "db:dev": "npx wrangler@4 d1 migrations apply PeloApp-dev --remote --env dev",
+    "deploy": "npm run check && npm run db:prod && npx wrangler@4 deploy",
+    "deploy:dev": "npm run check && npm run db:dev && npx wrangler@4 deploy --env dev"
+  }
+}
