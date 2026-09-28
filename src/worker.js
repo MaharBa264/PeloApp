@@ -41,7 +41,7 @@ async function pending(db, clientId) {
 async function detail(db, client, offset=0) {
   assert(Number.isSafeInteger(offset)&&offset>=0,'Página inválida.');
   const lines = await pending(db, client.id);
-  const events = await rows(db, 'SELECT e.*,u.name AS actor_name,(v.target_event_id IS NOT NULL) AS voided FROM events e JOIN users u ON u.id=e.actor LEFT JOIN event_voids v ON v.target_event_id=e.id WHERE client_id=? ORDER BY version DESC LIMIT 50 OFFSET ?', client.id,offset);
+  const events = await rows(db, 'SELECT e.*,u.name AS actor_name,(v.target_event_id IS NOT NULL) AS voided,ve.kind AS void_kind FROM events e JOIN users u ON u.id=e.actor LEFT JOIN event_voids v ON v.target_event_id=e.id LEFT JOIN events ve ON ve.id=v.void_event_id WHERE e.client_id=? ORDER BY e.version DESC LIMIT 50 OFFSET ?', client.id,offset);
   return { client, offset, lines: lines.map(l => ({ ...l, current_value: valueOf(l, 'current') })), events: events.map(e => ({ ...e, voided: Boolean(e.voided), data: JSON.parse(e.data) })) };
 }
 async function commitAccount(db, client, user, key, kind, data, requestHash, statements) {
@@ -126,6 +126,20 @@ async function extractDocument(env, data, type, requestedType) {
     console.error('document_ai_failed', error?.name || 'Error');
     return { status: 'error', data: normalizeDocumentData({ document_type: requestedType }) };
   }
+}
+async function buildCharge(db, user, client, b) {
+  assert(Number.isInteger(b.quantity) && b.quantity > 0 && b.quantity <= 1000, 'Cantidad: entre 1 y 1000 unidades.');
+  const product = b.product_id ? await one(db, 'SELECT * FROM products WHERE id=?', b.product_id) : null;
+  assert(!b.product_id || product, 'Producto no encontrado.');
+  const schoolPrice=product?await one(db,'SELECT price FROM product_school_prices WHERE product_id=? AND school_id=?',product.id,client.school_id):null;
+  const effectivePrice=schoolPrice?.price??product?.price;
+  const unitPrice = b.unit_price==null&&product?effectivePrice:cents(b.unit_price); assert(unitPrice > 0, 'El precio debe ser mayor a cero.');
+  if (user.role === 'operator' && product) assert(unitPrice === effectivePrice, 'Solo un administrador puede cargar un precio histórico diferente.', 403);
+  const description = product?.name || text(b.description);
+  assert(description, 'Indicá el concepto.');
+  assert(/^\d{4}-\d{2}-\d{2}$/.test(b.occurred_on || '') && !Number.isNaN(Date.parse(b.occurred_on)) && new Date(b.occurred_on).toISOString().slice(0,10) === b.occurred_on, 'Fecha inválida.');
+  const charge = { id: id(), description, quantity: b.quantity, unit_price: unitPrice, total: unitPrice * b.quantity, product_id: product?.id || null, occurred_on: b.occurred_on };
+  return charge;
 }
 async function api(request, env) {
   const db = env.DB, url = new URL(request.url), path = url.pathname, method = request.method;
@@ -251,7 +265,7 @@ async function api(request, env) {
     await db.batch([...schoolIds.map((s,i)=>stmt(db,'INSERT INTO clients(id,name,kind,contact,school_id,mode,created_at,profile_id) VALUES (?,?,?,?,?,?,?,?)',accountIds[i],text(b.name),b.kind,text(b.contact),s,b.mode,created,profileId)),audit(db,user.id,'client.create',{profile_id:profileId,name:text(b.name),schools:schoolIds,mode:b.mode})]);
     return json({ id: accountIds[0], profile_id:profileId, accounts:accountIds.map((id,i)=>({id,school_id:schoolIds[i]})) }, 201);
   }
-  const match = path.match(/^\/api\/clients\/([^/]+)(?:\/(charge|quote|payment|schools|void))?$/);
+  const match = path.match(/^\/api\/clients\/([^/]+)(?:\/(charge|quote|payment|schools|void|amend))?$/);
   if (match) {
     const client = await account(db, user, match[1]);
     if (!match[2] && method === 'GET') return json(await detail(db, client,Number(url.searchParams.get('offset')||0)));
@@ -312,6 +326,27 @@ async function api(request, env) {
       await commitAccount(db, client, user, key, 'void', { target_id: target.id, target_kind: target.kind, reason, credit }, requestHash, statements);
       return json({ ok: true });
     }
+    if (match[2] === 'amend' && method === 'POST') {
+      role(user, ['superadmin','admin']);
+      const b = await body(request), key = request.headers.get('Idempotency-Key'), reason = text(b.reason, 300);
+      assert(reason.length >= 3, 'Indicá el motivo de la modificación.');
+      const requestHash = await hash(JSON.stringify({ action: 'amend', b }));
+      const old = await one(db, 'SELECT client_id,request_hash FROM events WHERE id=?', key || '');
+      if (old) { assert(old.client_id === client.id && old.request_hash === requestHash, 'Identificador de operación ya utilizado.', 409); return json({ ok: true, repeated: true }); }
+      const target = await one(db, "SELECT * FROM events WHERE id=? AND client_id=? AND kind='charge'", String(b.event_id || ''), client.id);
+      assert(target, 'Consumo no encontrado.', 404);
+      assert(!await one(db, 'SELECT 1 AS x FROM event_voids WHERE target_event_id=?', target.id), 'Ese consumo ya fue anulado o modificado.', 409);
+      const charge = await one(db, 'SELECT * FROM charges WHERE event_id=? AND client_id=?', target.id, client.id);
+      assert(charge, 'No se encontró el consumo original.', 404);
+      assert(charge.remaining === charge.quantity * charge.unit_price, 'El consumo ya tiene pagos aplicados. Anulá primero esos pagos.', 409);
+      const next = await buildCharge(db, user, client, b);
+      await commitAccount(db, client, user, key, 'amend', { target_id: target.id, reason, before: JSON.parse(target.data), after: next }, requestHash, [
+        stmt(db, 'UPDATE charges SET remaining=0 WHERE id=? AND remaining=quantity*unit_price', charge.id),
+        stmt(db, 'INSERT INTO charges VALUES (?,?,?,?,?,?,?,?,?)', next.id, client.id, next.product_id, next.description, next.quantity, next.unit_price, next.total, next.occurred_on, key),
+        stmt(db, 'INSERT INTO event_voids VALUES (?,?,?,?,?)', target.id, key, reason, user.id, now())
+      ]);
+      return json({ ok: true });
+    }
     role(user, ['superadmin','admin','operator']); assert(method === 'POST', 'Método no permitido.', 405);
     const b = await body(request), action = match[2], key = request.headers.get('Idempotency-Key');
     const requestHash = await hash(JSON.stringify({ action, b }));
@@ -320,18 +355,8 @@ async function api(request, env) {
       if (old) { assert(old.client_id === client.id && old.request_hash === requestHash, 'Identificador de operación ya utilizado.', 409); return json({ ok: true, repeated: true }); }
     }
     if (action === 'charge') {
-      assert(Number.isInteger(b.quantity) && b.quantity > 0 && b.quantity <= 1000, 'Cantidad: entre 1 y 1000 unidades.');
-      const product = b.product_id ? await one(db, 'SELECT * FROM products WHERE id=?', b.product_id) : null;
-      assert(!b.product_id || product, 'Producto no encontrado.');
-      const schoolPrice=product?await one(db,'SELECT price FROM product_school_prices WHERE product_id=? AND school_id=?',product.id,client.school_id):null;
-      const effectivePrice=schoolPrice?.price??product?.price;
-      const unitPrice = b.unit_price==null&&product?effectivePrice:cents(b.unit_price); assert(unitPrice > 0, 'El precio debe ser mayor a cero.');
-      if (user.role === 'operator' && product) assert(unitPrice === effectivePrice, 'Solo un administrador puede cargar un precio histórico diferente.', 403);
-      const description = product?.name || text(b.description);
-      assert(description, 'Indicá el concepto.');
-      assert(/^\d{4}-\d{2}-\d{2}$/.test(b.occurred_on || '') && !Number.isNaN(Date.parse(b.occurred_on)) && new Date(b.occurred_on).toISOString().slice(0,10) === b.occurred_on, 'Fecha inválida.');
-      const charge = { id: id(), description, quantity: b.quantity, unit_price: unitPrice, total: unitPrice * b.quantity, product_id: product?.id || null, occurred_on: b.occurred_on };
-      await commitAccount(db, client, user, key, 'charge', charge, requestHash, [stmt(db, 'INSERT INTO charges VALUES (?,?,?,?,?,?,?,?,?)', charge.id, client.id, charge.product_id, description, charge.quantity, unitPrice, charge.total, b.occurred_on, key)]);
+      const charge = await buildCharge(db, user, client, b);
+      await commitAccount(db, client, user, key, 'charge', charge, requestHash, [stmt(db, 'INSERT INTO charges VALUES (?,?,?,?,?,?,?,?,?)', charge.id, client.id, charge.product_id, charge.description, charge.quantity, charge.unit_price, charge.total, charge.occurred_on, key)]);
       return json({ ok: true });
     }
     if (action === 'quote' || action === 'payment') {

@@ -16,6 +16,7 @@ Cuentas corrientes de tres kioscos escolares. Interfaz luminosa adaptable a celu
 - Movimientos con fecha, responsable, aplicación a consumos y ajuste de precio.
 - Operaciones financieras atómicas, bloqueo optimista e identificador para reintentos.
 - Anulación de consumos y pagos (administradores) con motivo obligatorio. El movimiento no se borra: queda tachado y se registra una anulación. Un consumo solo se anula si no tiene pagos aplicados; un pago solo si es el más reciente de la cuenta (restituye los consumos y el anticipo previo).
+- Modificación de consumos (administradores) con motivo: el original queda marcado como modificado y se registra el nuevo, con "antes" y "ahora". Mismas reglas que la anulación: sin pagos aplicados.
 - Usuarios activos/inactivos y colegios asignados; personalización por superadministrador.
 - Resumen imprimible mediante navegador (también guardar PDF).
 

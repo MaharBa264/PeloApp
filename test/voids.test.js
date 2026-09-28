@@ -63,5 +63,22 @@ test('voiding charges and payments restores balances and keeps the ledger', asyn
   assert.equal(d.client.credit, 0);
   assert.equal(d.lines.reduce((s, l) => s + l.remaining, 0), 30000);
   assert.equal((await voidOf('nonexistent')).status, 404);
+
+  // amending a charge replaces it atomically and keeps both records
+  const wrong = await charge('900', 2);
+  const amend = (event_id, extra = {}, opts = key()) => call(`/clients/${client}/amend`, 'POST', { event_id, reason: 'Precio mal cargado', description: 'Cafe', quantity: 2, unit_price: '800', occurred_on: '2026-09-26', ...extra }, opts);
+  const before = (await detail()).lines.reduce((s, l) => s + l.remaining, 0);
+  assert.equal((await amend(wrong, { reason: '' })).status, 400);
+  assert.equal((await amend(wrong, { unit_price: 'abc' })).status, 400);
+  assert.equal((await detail()).lines.reduce((s, l) => s + l.remaining, 0), before, 'failed amend changes nothing');
+  r = await call(`/clients/${client}/amend`, 'POST', { event_id: wrong, reason: 'x y z', description: 'Cafe', quantity: 2, unit_price: '800', occurred_on: '2026-09-26' }, { cookie: opCookie, ...key() });
+  assert.equal(r.status, 403, 'operators cannot amend');
+  assert.equal((await amend(wrong)).status, 200);
+  d = await detail();
+  assert.equal(d.lines.reduce((s, l) => s + l.remaining, 0), before - 2 * 90000 + 2 * 80000);
+  assert.equal(d.events.find(e => e.id === wrong).void_kind, 'amend');
+  assert.equal((await amend(wrong)).status, 409, 'cannot amend twice');
+  const newest = d.events.find(e => e.kind === 'amend');
+  assert.equal(newest.data.after.unit_price, 80000);
   void adminCookie;
 });
