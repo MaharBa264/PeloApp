@@ -35,7 +35,9 @@ Cloudflare → Workers & Pages → Create application → Import a repository �
 
 Cloudflare debe instalar dependencias con `npm ci` (usa el package-lock del repositorio). Los comandos de build y deploy no cambian en esta actualización.
 
-El comando verifica el proyecto, aplica migraciones **a PeloApp-dev** y despliega `--env dev`. No agrega credenciales al repositorio. La identidad de build de Cloudflare necesita permisos de edición de Workers y D1 para aplicar migraciones; si la migración devuelve autorización denegada, revisar el token de build del proyecto en Cloudflare. No pegar tokens en issues o archivos.
+El comando verifica el proyecto, aplica migraciones **a PeloApp-dev** y despliega `--env dev`. No agrega credenciales al repositorio.
+
+Configuración verificada en Cloudflare el 28/09/2026: repositorio `MaharBa264/PeloApp`, rama `dev`, raíz `/`, build `npm run check` y deploy `npm run deploy:dev`. Una vez conectada la integración, Cloudflare solo procesa pushes nuevos; para iniciar el primer build posterior a la conexión, hace falta un commit nuevo en `dev`. La identidad de build de Cloudflare necesita permisos de edición de Workers y D1 para aplicar migraciones; si la migración devuelve autorización denegada, revisar el token de build del proyecto en Cloudflare. No pegar tokens en issues o archivos.
 
 ## Crear el superadministrador
 
