@@ -9,6 +9,17 @@
 
 Los IDs no son credenciales. El binding de la aplicación se llama `DB`. Ambas bases pertenecen a la cuenta Cloudflare del propietario; este repositorio no demuestra que ya se hayan aplicado migraciones ni publicado Workers.
 
+## Almacenamiento de fotos de documentos
+
+Antes del siguiente despliegue, crear dos buckets desde Cloudflare → R2 Object Storage → **Create bucket**:
+
+- `peloapp-documents-dev`
+- `peloapp-documents-prod`
+
+Dejarlos privados: no habilitar acceso público ni dominio personalizado. `wrangler.jsonc` los enlaza al Worker correspondiente. El Worker verifica sesión y rol antes de guardar o mostrar una imagen. La binding de Workers AI `AI` no usa un token; el código invoca `@cf/moondream/moondream3.1-9B-A2B` para leer una propuesta desde la foto.
+
+Workers AI tiene una cuota gratuita diaria; al agotarse, la app igual guarda el documento como borrador manual para que se complete sin OCR. Revisar la cuota y las condiciones vigentes en Cloudflare antes de cargar documentos reales.
+
 ## Primero: entorno de pruebas
 
 Cloudflare → Workers & Pages → Create application → Import a repository → MaharBa264/PeloApp.
@@ -59,6 +70,7 @@ Cada push a main ejecuta los controles antes de migrar y publicar. Si los contro
 4. Crear producto y cliente de prueba, cargar consumo, aumentar precio y cobrar parcialmente.
 5. Probar usuario de otro colegio: no debe acceder a la cuenta.
 6. Hacer un commit inocuo en la rama correspondiente y comprobar en Builds la publicación automática.
+7. En `dev`, probar una foto de factura, corregir un renglón, guardar y volver a abrirla. Verificar que se ve el original, que el documento sigue como borrador y que ningún precio de venta o saldo cambió.
 
 ## Actualizaciones y respaldo
 

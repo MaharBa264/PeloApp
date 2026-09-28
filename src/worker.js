@@ -77,6 +77,56 @@ async function rateLimit(db, request) {
   assert(recent.n < 15, 'Demasiados intentos. Esperá 15 minutos.', 429);
   await db.batch([stmt(db, 'INSERT INTO auth_attempts VALUES (?,?,?)', id(), ip, Date.now()), stmt(db, 'DELETE FROM auth_attempts WHERE at<?', since)]);
 }
+const documentTypes = ['invoice','delivery_note','order','other'];
+function normalizeDocumentData(value) {
+  const data = value && typeof value === 'object' ? value : {};
+  const lines = Array.isArray(data.lines) ? data.lines.slice(0, 150).map(line => ({
+    code: text(line?.code, 80), description: text(line?.description, 180),
+    quantity: String(line?.quantity ?? '').slice(0, 32), unit: text(line?.unit, 32),
+    unit_price: String(line?.unit_price ?? '').slice(0, 32), line_total: String(line?.line_total ?? '').slice(0, 32)
+  })) : [];
+  return {
+    document_type: documentTypes.includes(data.document_type) ? data.document_type : 'other',
+    supplier: text(data.supplier, 180), document_number: text(data.document_number, 100),
+    document_date: /^\d{4}-\d{2}-\d{2}$/.test(data.document_date || '') ? data.document_date : '',
+    total: String(data.total ?? '').slice(0, 32), notes: text(data.notes, 1000), lines
+  };
+}
+function validDocumentDate(value) {
+  return !value || /^\d{4}-\d{2}-\d{2}$/.test(value) && !Number.isNaN(Date.parse(`${value}T12:00:00Z`)) && new Date(`${value}T12:00:00Z`).toISOString().slice(0,10) === value;
+}
+function parseDocumentAnswer(answer) {
+  if (typeof answer !== 'string') return null;
+  const start = answer.indexOf('{'), end = answer.lastIndexOf('}');
+  if (start < 0 || end <= start) return null;
+  try { const result = JSON.parse(answer.slice(start, end + 1)); return result && typeof result === 'object' ? result : null; } catch { return null; }
+}
+function base64(data) {
+  let binary = '';
+  for (let start = 0; start < data.length; start += 0x8000) binary += String.fromCharCode(...data.subarray(start, start + 0x8000));
+  return btoa(binary);
+}
+function hasImageSignature(data, type) {
+  if (type === 'image/jpeg') return data[0] === 0xff && data[1] === 0xd8 && data[2] === 0xff;
+  if (type === 'image/png') return data[0] === 0x89 && data[1] === 0x50 && data[2] === 0x4e && data[3] === 0x47;
+  if (type === 'image/webp') return String.fromCharCode(...data.subarray(0,4)) === 'RIFF' && String.fromCharCode(...data.subarray(8,12)) === 'WEBP';
+  return false;
+}
+async function extractDocument(env, data, type, requestedType) {
+  if (!env.AI) return { status: 'unavailable', data: normalizeDocumentData({ document_type: requestedType }) };
+  try {
+    const answer = await env.AI.run('@cf/moondream/moondream3.1-9B-A2B', {
+      task: 'query', image: `data:${type};base64,${base64(data)}`, reasoning: false,
+      temperature: 0, max_tokens: 4096,
+      question: `Leé esta foto de un documento comercial argentino. Devolvé SOLO un objeto JSON válido, sin texto ni Markdown, con este formato: {"document_type":"invoice|delivery_note|order|other","supplier":"","document_number":"","document_date":"YYYY-MM-DD o vacío","total":"","notes":"anotaciones visibles","lines":[{"code":"","description":"","quantity":"","unit":"","unit_price":"","line_total":""}]}. Transcribí lo legible sin inventar valores. Conservá importes como texto tal como aparecen. Si un dato no se lee, dejalo vacío. Tipo sugerido: ${requestedType}.`
+    });
+    const parsed = parseDocumentAnswer(answer?.answer);
+    return parsed ? { status: 'review', data: normalizeDocumentData(parsed) } : { status: 'error', data: normalizeDocumentData({ document_type: requestedType }) };
+  } catch (error) {
+    console.error('document_ai_failed', error?.name || 'Error');
+    return { status: 'error', data: normalizeDocumentData({ document_type: requestedType }) };
+  }
+}
 async function api(request, env) {
   const db = env.DB, url = new URL(request.url), path = url.pathname, method = request.method;
   assert(db, 'Falta vincular la base D1.', 503);
@@ -114,6 +164,67 @@ async function api(request, env) {
   const token = (request.headers.get('Cookie') || '').match(/(?:^|;\s*)pelo_session=([^;]+)/)?.[1] || '';
   const user = await one(db, 'SELECT u.* FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token=? AND s.expires_at>? AND u.active=1', await hash(token), Date.now());
   assert(user, 'Iniciá sesión para continuar.', 401);
+  if (path === '/api/documents' || path.startsWith('/api/documents/')) {
+    role(user, ['superadmin','admin']);
+    assert(env.DOCUMENTS, 'Falta configurar el almacenamiento privado de documentos en Cloudflare R2.', 503);
+    if (path === '/api/documents' && method === 'GET') {
+      return json(await rows(db, `SELECT id,document_type,status,supplier,document_number,document_date,related_document_id,file_type,file_size,ai_status,reviewed,reviewed_at,actor,created_at,updated_at FROM documents ORDER BY created_at DESC LIMIT 100`));
+    }
+    if (path === '/api/documents' && method === 'POST') {
+      const length = Number(request.headers.get('Content-Length') || 0);
+      assert(!length || length <= 3_500_000, 'La imagen debe pesar menos de 3 MB.', 413);
+      assert((request.headers.get('Content-Type') || '').startsWith('multipart/form-data'), 'Subí una foto del documento.', 415);
+      const form = await request.formData(), file = form.get('file'), requestedType = String(form.get('document_type') || 'other');
+      assert(file instanceof File && file.size > 0 && file.size <= 3 * 1024 * 1024, 'Elegí una imagen de hasta 3 MB.', 413);
+      assert(documentTypes.includes(requestedType), 'Tipo de documento inválido.');
+      const type = String(file.type || '').toLowerCase();
+      assert(['image/jpeg','image/png','image/webp'].includes(type), 'Usá una foto JPG, PNG o WebP.');
+      const image = new Uint8Array(await file.arrayBuffer());
+      assert(hasImageSignature(image, type), 'El archivo no coincide con el formato de imagen declarado.');
+      const documentId = id(), fileKey = `documents/${documentId}`;
+      await env.DOCUMENTS.put(fileKey, image, { httpMetadata: { contentType: type, cacheControl: 'private, no-store' } });
+      const extracted = await extractDocument(env, image, type, requestedType), data = extracted.data;
+      const date = now();
+      try {
+        await db.batch([
+          stmt(db, 'INSERT INTO documents(id,document_type,supplier,document_number,document_date,file_key,file_type,file_size,ai_status,data,actor,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)', documentId, data.document_type, data.supplier, data.document_number, data.document_date, fileKey, type, image.length, extracted.status, JSON.stringify(data), user.id, date, date),
+          audit(db, user.id, 'document.upload', { id: documentId, document_type: data.document_type, ai_status: extracted.status, size: image.length })
+        ]);
+      } catch (error) { await env.DOCUMENTS.delete(fileKey); throw error; }
+      return json({ id: documentId, document_type: data.document_type, ai_status: extracted.status, data }, 201);
+    }
+      const documentMatch = path.match(/^\/api\/documents\/([^/]+)(?:\/(image))?$/);
+    if (documentMatch) {
+      const doc = await one(db, 'SELECT * FROM documents WHERE id=?', documentMatch[1]);
+      assert(doc, 'Documento no encontrado.', 404);
+      if (!documentMatch[2] && method === 'GET') {
+        const { file_key, ...safe } = doc;
+        return json({ ...safe, data: JSON.parse(doc.data) });
+      }
+      if (documentMatch[2] === 'image' && method === 'GET') {
+        const object = await env.DOCUMENTS.get(doc.file_key); assert(object, 'La imagen original no está disponible.', 404);
+        return new Response(object.body, { headers: { 'Content-Type': doc.file_type, 'Content-Length': String(doc.file_size), 'Cache-Control': 'private, no-store', 'Content-Disposition': 'inline' } });
+      }
+      if (!documentMatch[2] && method === 'PUT') {
+        const b = await body(request), data = normalizeDocumentData(b.data);
+        assert(documentTypes.includes(data.document_type), 'Tipo de documento inválido.');
+        assert(validDocumentDate(data.document_date), 'Fecha inválida.');
+        const related = text(b.related_document_id, 80);
+        assert(!related || related !== doc.id && await one(db, 'SELECT id FROM documents WHERE id=?', related), 'Documento relacionado inválido.');
+        const date = now();
+        await db.batch([
+          stmt(db, 'UPDATE documents SET document_type=?,supplier=?,document_number=?,document_date=?,related_document_id=?,data=?,reviewed=1,reviewed_at=?,updated_at=? WHERE id=?', data.document_type, data.supplier, data.document_number, data.document_date, related || null, JSON.stringify(data), date, date, doc.id),
+          audit(db, user.id, 'document.review', { id: doc.id, related_document_id: related || null, lines: data.lines.length })
+        ]);
+        return json({ ok: true });
+      }
+      if (!documentMatch[2] && method === 'DELETE') {
+        await db.batch([stmt(db, 'DELETE FROM documents WHERE id=?', doc.id), audit(db, user.id, 'document.delete', { id: doc.id })]);
+        await env.DOCUMENTS.delete(doc.file_key);
+        return json({ ok: true });
+      }
+    }
+  }
   if (path === '/api/logout' && method === 'POST') {
     await stmt(db, 'DELETE FROM sessions WHERE token=?', await hash(token)).run();
     return json({ ok: true }, 200, { 'Set-Cookie': 'pelo_session=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0' });
