@@ -1,3 +1,4 @@
+import { planImport } from './import-products.js';
 import { assert, cents, settlement, valueOf } from './domain.js';
 
 const id = () => crypto.randomUUID();
@@ -27,7 +28,7 @@ const audit = (db, actor, action, data) => stmt(db, 'INSERT INTO audit VALUES (?
 async function body(request) {
   assert((request.headers.get('content-type') || '').includes('application/json'), 'Se requiere JSON.', 415);
   const raw = await request.text();
-  assert(raw.length <= 32000, 'Solicitud demasiado grande.', 413);
+  assert(raw.length <= 180000, 'Solicitud demasiado grande.', 413);
   try { return JSON.parse(raw); } catch { assert(false, 'JSON inválido.'); }
 }
 async function account(db, user, clientId) {
@@ -37,10 +38,11 @@ async function account(db, user, clientId) {
 async function pending(db, clientId) {
   return rows(db, 'SELECT c.*,p.price AS current_price FROM charges c LEFT JOIN products p ON p.id=c.product_id WHERE c.client_id=? AND c.remaining>0 ORDER BY c.occurred_on,c.id', clientId);
 }
-async function detail(db, client) {
+async function detail(db, client, offset=0) {
+  assert(Number.isSafeInteger(offset)&&offset>=0,'Página inválida.');
   const lines = await pending(db, client.id);
-  const events = await rows(db, 'SELECT e.*,u.name AS actor_name FROM events e JOIN users u ON u.id=e.actor WHERE client_id=? ORDER BY version DESC LIMIT 200', client.id);
-  return { client, lines: lines.map(l => ({ ...l, current_value: valueOf(l, 'current') })), events: events.map(e => ({ ...e, data: JSON.parse(e.data) })) };
+  const events = await rows(db, 'SELECT e.*,u.name AS actor_name FROM events e JOIN users u ON u.id=e.actor WHERE client_id=? ORDER BY version DESC LIMIT 50 OFFSET ?', client.id,offset);
+  return { client, offset, lines: lines.map(l => ({ ...l, current_value: valueOf(l, 'current') })), events: events.map(e => ({ ...e, data: JSON.parse(e.data) })) };
 }
 async function commitAccount(db, client, user, key, kind, data, requestHash, statements) {
   assert(/^[a-zA-Z0-9-]{16,80}$/.test(key || ''), 'Falta el identificador de operación.');
@@ -53,6 +55,19 @@ async function commitAccount(db, client, user, key, kind, data, requestHash, sta
   } catch (error) {
     if (/UNIQUE constraint/.test(error.message)) assert(false, 'La cuenta cambió mientras operabas. Actualizá y revisá antes de confirmar.', 409);
     throw error;
+  }
+}
+async function catalogCommit(db,user,key,requestHash,version,statements) {
+  assert(/^[a-zA-Z0-9-]{16,80}$/.test(key||''),'Falta el identificador de importación.');
+  try { await db.batch([stmt(db,'INSERT INTO catalog_events VALUES (?,?,?,?,?)',key,version+1,user.id,requestHash,now()),...statements]); }
+  catch(e){if(/UNIQUE constraint/.test(e.message))assert(false,'El catálogo cambió. Revisá de nuevo antes de guardar.',409);throw e;}
+}
+async function catalogVersion(db){return (await one(db,'SELECT COALESCE(MAX(version),0) AS n FROM catalog_events')).n;}
+function manageUser(user,target){
+  role(user,['superadmin','admin']);
+  if(user.role==='admin'){
+    assert(['operator','viewer'].includes(target.role),'Solo el superadministrador puede administrar ese nivel.',403);
+    JSON.parse(target.school_ids).forEach(s=>scope(user,s));
   }
 }
 async function rateLimit(db, request) {
@@ -123,7 +138,17 @@ async function api(request, env) {
   const match = path.match(/^\/api\/clients\/([^/]+)(?:\/(charge|quote|payment))?$/);
   if (match) {
     const client = await account(db, user, match[1]);
-    if (!match[2] && method === 'GET') return json(await detail(db, client));
+    if (!match[2] && method === 'GET') return json(await detail(db, client,Number(url.searchParams.get('offset')||0)));
+    if(!match[2] && method==='PUT'){
+      role(user,['superadmin','admin']); const b=await body(request);
+      assert(text(b.name) && ['Familia','Alumno','Personal','Otro'].includes(b.kind),'Nombre o tipo inválido.');
+      assert(['original','current'].includes(b.mode),'Criterio de cobro inválido.');
+      assert(b.version===client.version,'La cuenta cambió. Volvé a abrir la edición.',409);
+      const data={before:{name:client.name,kind:client.kind,contact:client.contact,notes:client.notes,mode:client.mode},after:{name:text(b.name),kind:b.kind,contact:text(b.contact),notes:text(b.notes,1000),mode:b.mode}};
+      const key=request.headers.get('Idempotency-Key'),requestHash=await hash(JSON.stringify(b));
+      await commitAccount(db,client,user,key,'profile',data,requestHash,[stmt(db,'UPDATE clients SET name=?,kind=?,contact=?,notes=?,mode=? WHERE id=?',data.after.name,data.after.kind,data.after.contact,data.after.notes,data.after.mode,client.id)]);
+      return json({ok:true});
+    }
     role(user, ['superadmin','admin','operator']); assert(method === 'POST', 'Método no permitido.', 405);
     const b = await body(request), action = match[2], key = request.headers.get('Idempotency-Key');
     const requestHash = await hash(JSON.stringify({ action, b }));
@@ -160,17 +185,43 @@ async function api(request, env) {
       return json({ ok: true });
     }
   }
+  if(path==='/api/products/history' && method==='GET'){
+    const productId=url.searchParams.get('product');
+    const limit=50,offset=Number(url.searchParams.get('offset')||0);
+    assert(Number.isSafeInteger(offset)&&offset>=0,'Página inválida.');
+    return json(await rows(db,'SELECT h.*,p.name AS product_name,u.name AS actor_name FROM price_history h JOIN products p ON p.id=h.product_id JOIN users u ON u.id=h.actor WHERE (? IS NULL OR h.product_id=?) ORDER BY h.created_at DESC,h.rowid DESC LIMIT ? OFFSET ?',productId,productId,limit,offset));
+  }
+  if(path==='/api/products/import' && method==='POST'){
+    role(user,['superadmin','admin']);const b=await body(request),key=request.headers.get('Idempotency-Key');
+    const requestHash=await hash(JSON.stringify({rows:b.rows,update_existing:b.update_existing,fingerprint:b.fingerprint}));
+    if(b.confirm){const old=await one(db,'SELECT request_hash FROM catalog_events WHERE id=?',key||'');if(old){assert(old.request_hash===requestHash,'Identificador reutilizado.',409);return json({ok:true,repeated:true});}}
+    const revision=await catalogVersion(db),products=await rows(db,'SELECT * FROM products ORDER BY id');
+    const plan=planImport(b.rows,products,b.update_existing===true);
+    const fingerprint=await hash(JSON.stringify({revision,plan}));
+    if(!b.confirm)return json({...plan,fingerprint});
+    assert(!plan.errors.length,'Corregí las filas con errores antes de importar.');
+    assert(b.fingerprint===fingerprint,'El catálogo cambió. Volvé a revisar la importación.',409);
+    const changes=plan.items.filter(x=>x.action!=='skip').map(x=>({...x,id:x.id||id()}));
+    assert(changes.length,'No hay cambios para guardar.');
+    const encoded=JSON.stringify(changes),created=now();
+    await catalogCommit(db,user,key,requestHash,revision,[
+      stmt(db,`INSERT INTO products(id,name,price,version) SELECT json_extract(value,'$.id'),json_extract(value,'$.name'),json_extract(value,'$.price'),0 FROM json_each(?) WHERE json_extract(value,'$.action')='create'`,encoded),
+      stmt(db,`UPDATE products SET price=(SELECT json_extract(value,'$.price') FROM json_each(?) WHERE json_extract(value,'$.id')=products.id),version=version+1 WHERE id IN (SELECT json_extract(value,'$.id') FROM json_each(?) WHERE json_extract(value,'$.action')='update')`,encoded,encoded),
+      stmt(db,`INSERT INTO price_history SELECT ? || ':' || json_extract(value,'$.id'),json_extract(value,'$.id'),json_extract(value,'$.price'),?,? FROM json_each(?)`,key,user.id,created,encoded),
+      audit(db,user.id,'products.import',{created:plan.create,updated:plan.update,skipped:plan.skip})
+    ]);return json({ok:true,created:plan.create,updated:plan.update,skipped:plan.skip});
+  }
   if (path === '/api/products' && method === 'POST') {
     role(user, ['superadmin','admin']); const b = await body(request), price = cents(b.price), productId = id();
     assert(text(b.name) && price > 0, 'Completá nombre y precio.');
-    await db.batch([stmt(db, 'INSERT INTO products(id,name,price) VALUES (?,?,?)', productId, text(b.name), price), stmt(db, 'INSERT INTO price_history VALUES (?,?,?,?,?)', id(), productId, price, user.id, now())]);
+    await catalogCommit(db,user,id(),'create',await catalogVersion(db),[stmt(db, 'INSERT INTO products(id,name,price) VALUES (?,?,?)', productId, text(b.name), price), stmt(db, 'INSERT INTO price_history VALUES (?,?,?,?,?)', id(), productId, price, user.id, now())]);
     return json({ ok: true });
   }
   if (/^\/api\/products\/[^/]+$/.test(path) && method === 'PUT') {
     role(user, ['superadmin','admin']); const b = await body(request), price = cents(b.price), productId = path.split('/').pop();
     assert(price > 0, 'Precio inválido.');
     const product = await one(db, 'SELECT * FROM products WHERE id=?', productId); assert(product, 'Producto no encontrado.', 404);
-    await db.batch([stmt(db, 'UPDATE products SET price=?,version=version+1 WHERE id=?', price, productId), stmt(db, 'INSERT INTO price_history VALUES (?,?,?,?,?)', id(), productId, price, user.id, now())]);
+    await catalogCommit(db,user,id(),'price',await catalogVersion(db),[stmt(db, 'UPDATE products SET price=?,version=version+1 WHERE id=?', price, productId), stmt(db, 'INSERT INTO price_history VALUES (?,?,?,?,?)', id(), productId, price, user.id, now())]);
     return json({ ok: true });
   }
   if (path === '/api/settings' && method === 'PUT') {
@@ -178,31 +229,45 @@ async function api(request, env) {
     assert(text(b.name) && /^#[0-9a-f]{6}$/i.test(b.color) && ['system','humanist','serif'].includes(b.font), 'Configuración inválida.');
     assert(!b.logo || /^https:\/\/[^\s]+$/.test(b.logo), 'El logo debe tener una dirección HTTPS.');
     const settings = { name: text(b.name, 60), color: b.color, font: b.font, logo: text(b.logo, 1000), footer: text(b.footer, 300) };
-    assert(Array.isArray(b.schools) && b.schools.length === 3 && new Set(b.schools.map(s => s.id)).size === 3 && b.schools.every(s => ['school-1','school-2','school-3'].includes(s.id) && text(s.name)), 'Completá los nombres de los tres colegios.');
-    await db.batch([stmt(db, 'UPDATE settings SET data=? WHERE id=1', JSON.stringify(settings)), ...b.schools.map(s => stmt(db, 'UPDATE schools SET name=? WHERE id=?', text(s.name), s.id)), audit(db, user.id, 'settings.update', settings)]);
+    assert(Array.isArray(b.schools) && b.schools.length === 3 && new Set(b.schools.map(s => s.id)).size === 3 && b.schools.every(s => ['school-1','school-2','school-3'].includes(s.id) && text(s.name) && (!s.logo || /^https:\/\/[^\s]+$/.test(s.logo)) && /^#[0-9a-f]{6}$/i.test(s.color||'#315ded')), 'Completá los nombres de los tres colegios.');
+    await db.batch([stmt(db, 'UPDATE settings SET data=? WHERE id=1', JSON.stringify(settings)), ...b.schools.map(s => stmt(db, 'UPDATE schools SET name=?,logo=?,color=? WHERE id=?', text(s.name),text(s.logo,1000),s.color||'#315ded',s.id)), audit(db, user.id, 'settings.update', {...settings,schools:b.schools})]);
     return json({ ok: true });
   }
   if (path === '/api/users' && method === 'GET') {
-    role(user, ['superadmin']); return json(await rows(db, 'SELECT id,name,email,role,school_ids,active FROM users ORDER BY name'));
+    role(user, ['superadmin','admin']);
+    const list=await rows(db,'SELECT id,name,email,role,school_ids,active FROM users ORDER BY name');
+    return json(list.filter(u=>user.role==='superadmin'||(['operator','viewer'].includes(u.role)&&JSON.parse(u.school_ids).every(s=>JSON.parse(user.school_ids).includes(s)))));
   }
   if (path === '/api/users' && method === 'POST') {
-    role(user, ['superadmin']); const b = await body(request);
+    role(user, ['superadmin','admin']); const b = await body(request);
     assert(text(b.name) && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(text(b.email)), 'Completá nombre y correo.');
     assert(['superadmin','admin','operator','viewer'].includes(b.role), 'Rol inválido.');
     assert(Array.isArray(b.school_ids) && b.school_ids.every(s => ['school-1','school-2','school-3'].includes(s)) && (b.role === 'superadmin' || b.school_ids.length), 'Asigná al menos un colegio.');
     assert(typeof b.password === 'string' && b.password.length >= 12 && b.password.length <= 128, 'Usá una contraseña de 12 a 128 caracteres.');
+    manageUser(user,{role:b.role,school_ids:JSON.stringify(b.school_ids)});
     const userId = id();
     await db.batch([stmt(db, 'INSERT INTO users(id,name,email,password,role,school_ids,created_at) VALUES (?,?,?,?,?,?,?)', userId, text(b.name), text(b.email).toLowerCase(), await passwordHash(b.password), b.role, JSON.stringify(b.school_ids), now()), audit(db, user.id, 'user.create', { id: userId, role: b.role, schools: b.school_ids })]);
     return json({ ok: true });
   }
   if (/^\/api\/users\/[^/]+$/.test(path) && method === 'PUT') {
-    role(user, ['superadmin']); const target = path.split('/').pop(), b = await body(request);
-    assert(target !== user.id, 'No podés desactivar tu propio acceso.');
-    assert(typeof b.active === 'boolean', 'Estado inválido.');
-    const targetUser = await one(db, 'SELECT role FROM users WHERE id=?', target);
-    assert(targetUser, 'Usuario no encontrado.', 404);
-    assert(targetUser.role !== 'superadmin', 'Esta versión no permite desactivar otros superadministradores.');
-    await db.batch([stmt(db, 'UPDATE users SET active=? WHERE id=?', b.active ? 1 : 0, target), stmt(db, 'DELETE FROM sessions WHERE user_id=?', target), audit(db, user.id, 'user.active', { id: target, active: b.active })]);
+    role(user,['superadmin','admin']);const target=path.split('/').pop(),b=await body(request);
+    const old=await one(db,'SELECT * FROM users WHERE id=?',target);assert(old,'Usuario no encontrado.',404);manageUser(user,old);
+    const next={...old,...b};
+    next.school_ids=b.school_ids??JSON.parse(old.school_ids);
+    assert(text(next.name)&&/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(text(next.email)),'Completá nombre y correo.');
+    assert(['superadmin','admin','operator','viewer'].includes(next.role),'Rol inválido.');
+    assert(Array.isArray(next.school_ids)&&next.school_ids.every(s=>['school-1','school-2','school-3'].includes(s))&&(next.role==='superadmin'||next.school_ids.length),'Asigná colegios válidos.');
+    manageUser(user,{role:next.role,school_ids:JSON.stringify(next.school_ids)});
+    const active=b.active===undefined?Boolean(old.active):b.active;assert(typeof active==='boolean','Estado inválido.');
+    assert(target!==user.id||(active&&next.role===old.role),'No podés desactivar o cambiar tu propio nivel.');
+    assert(old.role!=='superadmin'||(next.role==='superadmin'&&active),'No se puede degradar o desactivar un superadministrador desde esta pantalla.');
+    let password=old.password;
+    if(b.password){assert(typeof b.password==='string'&&b.password.length>=12&&b.password.length<=128,'Contraseña: de 12 a 128 caracteres.');password=await passwordHash(b.password);}
+    await db.batch([
+      stmt(db,'UPDATE users SET name=?,email=?,role=?,school_ids=?,active=?,password=? WHERE id=?',text(next.name),text(next.email).toLowerCase(),next.role,JSON.stringify(next.school_ids),active?1:0,password,target),
+      stmt(db,'DELETE FROM sessions WHERE user_id=?',target),
+      audit(db,user.id,'user.update',{id:target,before:{name:old.name,email:old.email,role:old.role,schools:JSON.parse(old.school_ids),active:Boolean(old.active)},after:{name:text(next.name),email:text(next.email),role:next.role,schools:next.school_ids,active},password_changed:Boolean(b.password)})
+    ]);
     return json({ ok: true });
   }
   assert(false, 'Ruta no encontrada.', 404);
@@ -222,7 +287,7 @@ export default {
     response.headers.set('Cache-Control', 'no-store');
     response.headers.set('X-Content-Type-Options', 'nosniff');
     response.headers.set('Referrer-Policy', 'same-origin');
-    response.headers.set('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' https: data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
+    response.headers.set('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' https: data:; connect-src 'self'; worker-src 'self' blob:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
     return response;
   }
 };

@@ -1,6 +1,6 @@
 # PeloApp
 
-Cuentas corrientes para tres kioscos escolares. Interfaz luminosa adaptable a celular y PC. Primera versión **0.1.0 de piloto**, con comparación de precios al adquirir y al pagar, anticipos y permisos por colegio.
+Cuentas corrientes para tres kioscos escolares. Interfaz luminosa adaptable a celular y PC. Primera versión **0.2.0 de piloto**, con comparación de precios al adquirir y al pagar, anticipos y permisos por colegio.
 
 ## Estado
 
@@ -11,9 +11,10 @@ Código y configuración preparados para Cloudflare Workers + D1. La conexión d
 
 ## Desarrollo
 
-Node.js 24 o superior. La interfaz y el Worker usan módulos JavaScript nativos sin dependencias de ejecución; no requieren un bundler de frontend. Wrangler se ejecuta con npx. Esta elección mantiene pequeña y verificable la primera versión, con la API separada de la interfaz para futuras apps.
+Node.js 24 o superior. La interfaz y el Worker usan módulos JavaScript. La importación Excel usa read-excel-file, empaquetado localmente con esbuild. No se carga código desde CDNs. La API permanece separada para futuras apps.
 
 ```sh
+npm ci
 npm run check
 npm run db:local
 npm run dev

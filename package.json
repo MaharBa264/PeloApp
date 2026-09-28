@@ -1,13 +1,23 @@
 {
-  "name": "peloapp", "version": "0.1.0", "private": true, "type": "module",
+  "name": "peloapp",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
   "scripts": {
     "test": "node --test test/*.test.js",
-    "check": "node --check src/worker.js && node --check public/app.js && npm test",
+    "check": "node --check src/worker.js && node --check public/app.js && npm test && npm run build",
     "dev": "npx wrangler@4 dev --env dev",
     "db:local": "npx wrangler@4 d1 migrations apply PeloApp-dev --local --env dev",
     "db:prod": "npx wrangler@4 d1 migrations apply PeloApp-prod --remote",
     "db:dev": "npx wrangler@4 d1 migrations apply PeloApp-dev --remote --env dev",
     "deploy": "npm run check && npm run db:prod && npx wrangler@4 deploy",
-    "deploy:dev": "npm run check && npm run db:dev && npx wrangler@4 deploy --env dev"
+    "deploy:dev": "npm run check && npm run db:dev && npx wrangler@4 deploy --env dev",
+    "build": "esbuild frontend/excel.js --bundle --format=esm --minify --outfile=public/excel.js"
+  },
+  "dependencies": {
+    "read-excel-file": "9.3.10"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.10"
   }
 }

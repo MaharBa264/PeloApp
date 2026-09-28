@@ -18,3 +18,9 @@ Fecha: 27/09/2026.
 - Restauración de una copia de base de datos.
 
 El despliegue inicial es para piloto con datos ficticios. Ver docs/ALCANCE.md para los pendientes antes de uso operativo.
+
+## Ampliación 0.2.0
+
+Se ejecutaron seis grupos de pruebas y el empaquetado del lector Excel. Se añadieron casos de importación atómica, reintentos, precios argentinos, duplicados, actualización optativa, conservación de precios de consumos, historial de precios, edición de clientes e invalidación de cotizaciones, administración de usuarios dentro de colegios asignados y rechazo de escalamiento de rol.
+
+La lectura visual/interactiva de un Excel real en navegador queda para comprobar con un archivo del usuario en dev. La biblioteca de lectura .xlsx quedó empaquetada en la aplicación y se sirve desde el mismo dominio.

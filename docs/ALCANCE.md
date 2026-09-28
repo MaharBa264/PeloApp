@@ -4,7 +4,7 @@
 
 Cuentas corrientes de tres kioscos escolares. Interfaz luminosa adaptable a celular y PC, usuarios con permisos por colegio, despliegue Cloudflare desde main. Stock, compras, documentos y contabilidad siguen en el proyecto; no son la prioridad del primer incremento.
 
-## Implementado en 0.1.0 (piloto)
+## Implementado (piloto)
 
 - Instalación inicial protegida por secreto; sesiones privadas y cuatro roles.
 - Clientes por colegio: familia, alumno, personal u otro. Contacto/referencia libre.
@@ -22,15 +22,15 @@ Cuentas corrientes de tres kioscos escolares. Interfaz luminosa adaptable a celu
 
 Importes en centavos enteros. Cada consumo conserva cantidad y precio unitario histórico. La fracción pendiente se representa mediante su importe base original, con precisión de un centavo. Al cobrar a precio vigente se valora esa fracción con el precio actual y se registra el ajuste respecto a la base cancelada. Los pagos parciales se prorratean con redondeo al centavo; la cancelación final absorbe el residuo. Un pago que no pueda representarse sin cerrar incorrectamente un residuo se rechaza con explicación.
 
-No se revaloriza lo ya pagado. Los cargos sin producto conservan su importe. Un precio menor también disminuye la valoración pendiente: no se aplica silenciosamente una regla de “solo aumentos”. El criterio de la cuenta no se modifica en esta versión.
+No se revaloriza lo ya pagado. Los cargos sin producto conservan su importe. Un precio menor también disminuye la valoración pendiente: no se aplica silenciosamente una regla de “solo aumentos”. Un administrador puede modificar el criterio de la cuenta; el cambio queda registrado y no altera los cobros anteriores.
 
 Al confirmar un cobro se emplea el precio revisado por el servidor; si la cuenta o el precio difieren de la vista previa se pide recalcular. El saldo a favor se aplica junto al siguiente cobro; un cobro de $0 permite aplicar solamente anticipos. No se aplica automáticamente al cargar consumos. Cada cuenta pertenece a un colegio; aún no hay cuentas familiares compartidas entre colegios.
 
 ## Pendientes para ampliar el piloto
 
-- Edición de clientes, alumnos vinculados estructurados, selección manual de ítems a cancelar y límites de crédito.
+- Alumnos vinculados estructurados, selección manual de ítems a cancelar y límites de crédito.
 - Reversión/anulación formal de movimientos con motivo; no editar saldos directamente para corregir errores.
-- Cambio de contraseña, recuperación de acceso y edición de asignaciones/roles existentes.
+- Recuperación de acceso por correo (ya se puede restablecer contraseña desde Usuarios).
 - Cuentas de proveedores separadas de clientes y circuito compra/remito/factura/pago.
 - Exportaciones estructuradas, respaldos externos en Drive y reportes Sheets. No están conectados todavía.
 - Stock por recuentos libres; salidas estimadas conciliadas con consumos registrados, mermas y transferencias.
@@ -42,3 +42,14 @@ Al confirmar un cobro se emplea el precio revisado por el servidor; si la cuenta
 ## Criterio de puesta en marcha
 
 Probar con datos ficticios en dev. El SQL y las pruebas de integración locales no sustituyen una validación contra Cloudflare D1 real. Verificar despliegue, autenticación, cuotas y tiempos de ejecución en la cuenta del usuario. Antes de operar con dinero real completar las correcciones/anulaciones, recuperación de acceso, respaldo y ensayo de restauración.
+
+## Ampliación 0.2.0
+
+- Historial de precios con fecha, responsable, filtro por producto y paginación.
+- Historial completo de movimientos paginado, incluidos cambios de ficha del cliente.
+- Colegios: nombre editable, color e iniciales automáticas; logo propio mediante URL HTTPS.
+- Cliente: nombre, tipo, contacto, notas y criterio de cobro editables por administrador de su colegio. El colegio de una cuenta existente se conserva.
+- Usuarios: creación y edición de nombre, correo, rol, colegios, estado y contraseña. Los administradores solo gestionan operadores/consulta cuyos colegios están completamente dentro de sus asignaciones. Solo el superadministrador gestiona niveles administrativos. Las sesiones del usuario editado se cierran.
+- Importación .xlsx: selección de hoja y columnas, primera fila como encabezado, vista previa, nombres repetidos y precios inválidos identificados. Hasta 300 filas y 3 MB por archivo.
+- Coincidencias de productos por nombre normalizado. Se omiten por defecto; actualizar sus precios requiere marcar la opción. Productos nuevos y cambios se guardan atómicamente, generan historial y no se duplican al reintentar. No se importan stocks ni costos en este incremento.
+- La migración 0002 conserva todos los usuarios, productos, consumos y pagos existentes.

@@ -20,6 +20,8 @@ Cloudflare → Workers & Pages → Create application → Import a repository �
 - Deploy command: `npm run deploy:dev`.
 - Node.js: 24 (variable de build `NODE_VERSION=24` si hace falta).
 
+Cloudflare debe instalar dependencias con `npm ci` (usa el package-lock del repositorio). Los comandos de build y deploy no cambian en esta actualización.
+
 El comando verifica el proyecto, aplica migraciones **a PeloApp-dev** y despliega `--env dev`. No agrega credenciales al repositorio. La identidad de build de Cloudflare necesita permisos de edición de Workers y D1 para aplicar migraciones; si la migración devuelve autorización denegada, revisar el token de build del proyecto en Cloudflare. No pegar tokens en issues o archivos.
 
 ## Crear el superadministrador
