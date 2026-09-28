@@ -1,7 +1,7 @@
 import { DatabaseSync } from 'node:sqlite';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 export class D1 {
-  constructor() { this.db = new DatabaseSync(':memory:'); this.db.exec(readFileSync(new URL('../migrations/0001_accounts.sql', import.meta.url),'utf8')); this.db.exec(readFileSync(new URL('../migrations/0002_management.sql', import.meta.url),'utf8')); this.db.exec(readFileSync(new URL('../migrations/0003_documents.sql', import.meta.url),'utf8')); this.db.exec(readFileSync(new URL('../migrations/0004_catalog_and_shared_clients.sql', import.meta.url),'utf8')); }
+  constructor() { this.db = new DatabaseSync(':memory:'); for (const f of readdirSync(new URL('../migrations/', import.meta.url)).sort()) this.db.exec(readFileSync(new URL(`../migrations/${f}`, import.meta.url), 'utf8')); }
   prepare(sql) {
     const db=this.db;
     return { bind(...args) { return { sql, args, first:async()=>db.prepare(sql).get(...args)||null, all:async()=>({results:db.prepare(sql).all(...args)}),run:async()=>({meta:db.prepare(sql).run(...args)}) }; } };

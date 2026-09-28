@@ -41,8 +41,8 @@ async function pending(db, clientId) {
 async function detail(db, client, offset=0) {
   assert(Number.isSafeInteger(offset)&&offset>=0,'Página inválida.');
   const lines = await pending(db, client.id);
-  const events = await rows(db, 'SELECT e.*,u.name AS actor_name FROM events e JOIN users u ON u.id=e.actor WHERE client_id=? ORDER BY version DESC LIMIT 50 OFFSET ?', client.id,offset);
-  return { client, offset, lines: lines.map(l => ({ ...l, current_value: valueOf(l, 'current') })), events: events.map(e => ({ ...e, data: JSON.parse(e.data) })) };
+  const events = await rows(db, 'SELECT e.*,u.name AS actor_name,(v.target_event_id IS NOT NULL) AS voided,ve.kind AS void_kind FROM events e JOIN users u ON u.id=e.actor LEFT JOIN event_voids v ON v.target_event_id=e.id LEFT JOIN events ve ON ve.id=v.void_event_id WHERE e.client_id=? ORDER BY e.version DESC LIMIT 50 OFFSET ?', client.id,offset);
+  return { client, offset, lines: lines.map(l => ({ ...l, current_value: valueOf(l, 'current') })), events: events.map(e => ({ ...e, voided: Boolean(e.voided), data: JSON.parse(e.data) })) };
 }
 async function commitAccount(db, client, user, key, kind, data, requestHash, statements) {
   assert(/^[a-zA-Z0-9-]{16,80}$/.test(key || ''), 'Falta el identificador de operación.');
@@ -53,7 +53,11 @@ async function commitAccount(db, client, user, key, kind, data, requestHash, sta
       stmt(db, 'UPDATE clients SET version=version+1 WHERE id=?', client.id)
     ]);
   } catch (error) {
-    if (/UNIQUE constraint/.test(error.message)) assert(false, 'La cuenta cambió mientras operabas. Actualizá y revisá antes de confirmar.', 409);
+    if (/UNIQUE constraint/.test(error.message)) {
+      const done = await one(db, 'SELECT client_id,request_hash FROM events WHERE id=?', key);
+      if (done && done.client_id === client.id && done.request_hash === requestHash) return;
+      assert(false, 'La cuenta cambió mientras operabas. Actualizá y revisá antes de confirmar.', 409);
+    }
     throw error;
   }
 }
@@ -115,17 +119,65 @@ function hasImageSignature(data, type) {
 async function extractDocument(env, data, type, requestedType) {
   if (!env.AI) return { status: 'unavailable', data: normalizeDocumentData({ document_type: requestedType }) };
   try {
-    const answer = await env.AI.run('@cf/moondream/moondream3.1-9B-A2B', {
+    let timer;
+    const answer = await Promise.race([new Promise((_, reject) => { timer = setTimeout(() => reject(Object.assign(new Error('timeout'), { name: 'Timeout' })), 25000); }), env.AI.run('@cf/moondream/moondream3.1-9B-A2B', {
       task: 'query', image: `data:${type};base64,${base64(data)}`, reasoning: false,
       temperature: 0, max_tokens: 4096,
       question: `Leé esta foto de un documento comercial argentino. Devolvé SOLO un objeto JSON válido, sin texto ni Markdown, con este formato: {"document_type":"invoice|delivery_note|order|other","supplier":"","document_number":"","document_date":"YYYY-MM-DD o vacío","total":"","notes":"anotaciones visibles","lines":[{"code":"","description":"","quantity":"","unit":"","unit_price":"","line_total":""}]}. Transcribí lo legible sin inventar valores. Conservá importes como texto tal como aparecen. Si un dato no se lee, dejalo vacío. Tipo sugerido: ${requestedType}.`
-    });
+    })]).finally(() => clearTimeout(timer));
     const parsed = parseDocumentAnswer(answer?.answer);
     return parsed ? { status: 'review', data: normalizeDocumentData(parsed) } : { status: 'error', data: normalizeDocumentData({ document_type: requestedType }) };
   } catch (error) {
     console.error('document_ai_failed', error?.name || 'Error');
     return { status: 'error', data: normalizeDocumentData({ document_type: requestedType }) };
   }
+}
+const localDate = ms => new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Argentina/San_Luis', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(ms));
+async function buildCharge(db, user, client, b, allowProductId = null) {
+  assert(Number.isInteger(b.quantity) && b.quantity > 0 && b.quantity <= 1000, 'Cantidad: entre 1 y 1000 unidades.');
+  const product = b.product_id ? await one(db, 'SELECT * FROM products WHERE id=?', b.product_id) : null;
+  assert(!b.product_id || product, 'Producto no encontrado.');
+  assert(!product?.archived_at || product.id === allowProductId, 'Ese producto está archivado. Elegí otro o cargá un concepto libre.');
+  const schoolPrice=product?await one(db,'SELECT price FROM product_school_prices WHERE product_id=? AND school_id=?',product.id,client.school_id):null;
+  const effectivePrice=schoolPrice?.price??product?.price;
+  const unitPrice = b.unit_price==null&&product?effectivePrice:cents(b.unit_price); assert(unitPrice > 0, 'El precio debe ser mayor a cero.');
+  if (user.role === 'operator' && product) assert(unitPrice === effectivePrice, `Solo un administrador puede cambiar el precio. El precio vigente es $${(effectivePrice / 100).toFixed(2)}: volvé a abrir el consumo para actualizarlo.`, 403);
+  const description = product?.name || text(b.description);
+  assert(description, 'Indicá el concepto.');
+  assert(/^\d{4}-\d{2}-\d{2}$/.test(b.occurred_on || '') && !Number.isNaN(Date.parse(b.occurred_on)) && new Date(b.occurred_on).toISOString().slice(0,10) === b.occurred_on, 'Fecha inválida.');
+  assert(b.occurred_on >= '2020-01-01' && b.occurred_on <= localDate(Date.now() + 86400000), 'La fecha del consumo debe estar entre 2020 y mañana.');
+  const charge = { id: id(), description, quantity: b.quantity, unit_price: unitPrice, total: unitPrice * b.quantity, product_id: product?.id || null, occurred_on: b.occurred_on };
+  return charge;
+}
+async function supplierEvolution(db, supplier, from, to) {
+  const products = await rows(db, 'SELECT id,name,archived_at FROM products WHERE supplier_id=? ORDER BY name', supplier.id);
+  const history = await rows(db, 'SELECT ph.product_id,ph.price,ph.created_at FROM price_history ph JOIN products p ON p.id=ph.product_id WHERE p.supplier_id=? ORDER BY ph.created_at,ph.id', supplier.id);
+  const byProduct = new Map(products.map(p => [p.id, []]));
+  history.forEach(h => byProduct.get(h.product_id).push(h));
+  const start = from ? `${from}T00:00:00.000Z` : null, end = `${to}T23:59:59.999Z`;
+  const priceAt = (list, t) => { let value = null; for (const h of list) { if (h.created_at <= t) value = h.price; else break; } return value; };
+  const pct = (a, b) => a && b != null ? Math.round((b - a) / a * 10000) / 100 : null;
+  const items = products.map(p => {
+    const list = byProduct.get(p.id), priceStart = start ? priceAt(list, start) : list[0]?.price ?? null, priceEnd = priceAt(list, end);
+    const changes = list.filter((h, i) => i > 0 && (!start || h.created_at > start) && h.created_at <= end).length;
+    return { id: p.id, name: p.name, archived: Boolean(p.archived_at), price_start: priceStart, price_end: priceEnd, change_pct: pct(priceStart, priceEnd), changes };
+  });
+  const compared = items.filter(i => i.change_pct !== null);
+  const changes = [];
+  products.forEach(p => byProduct.get(p.id).forEach((h, i, list) => { if (i > 0 && (!start || h.created_at > start) && h.created_at <= end) changes.push({ product_id: p.id, name: p.name, price: h.price, previous: list[i - 1].price, pct: pct(list[i - 1].price, h.price), created_at: h.created_at }); }));
+  changes.sort((a, b) => b.created_at.localeCompare(a.created_at));
+  const first = history[0]?.created_at.slice(0, 10), begin = from || first || to;
+  const series = [];
+  const base = compared.map(i => ({ list: byProduct.get(i.id), start: i.price_start }));
+  const day = 86400000, span = Math.max(0, (Date.parse(`${to}T00:00:00Z`) - Date.parse(`${begin}T00:00:00Z`)) / day), step = Math.max(7, Math.ceil(span / 24));
+  for (let offset = 0; offset <= span + step - 1; offset += step) {
+    const date = offset >= span ? to : new Date(Date.parse(`${begin}T00:00:00Z`) + offset * day).toISOString().slice(0, 10);
+    const ratios = base.map(b => { const price = priceAt(b.list, `${date}T23:59:59.999Z`); return price == null ? null : price / b.start * 100; }).filter(v => v !== null);
+    series.push({ date, index: ratios.length ? Math.round(ratios.reduce((a, b) => a + b, 0) / ratios.length * 100) / 100 : null });
+    if (date === to) break;
+  }
+  const average = compared.length ? Math.round(compared.reduce((a, i) => a + i.change_pct, 0) / compared.length * 100) / 100 : null;
+  return { supplier: { id: supplier.id, name: supplier.name }, from: from || first || null, to, summary: { products: items.length, compared: compared.length, with_change: items.filter(i => i.changes > 0).length, average_change_pct: average }, items, changes, series };
 }
 async function api(request, env) {
   const db = env.DB, url = new URL(request.url), path = url.pathname, method = request.method;
@@ -164,6 +216,7 @@ async function api(request, env) {
   const token = (request.headers.get('Cookie') || '').match(/(?:^|;\s*)pelo_session=([^;]+)/)?.[1] || '';
   const user = await one(db, 'SELECT u.* FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token=? AND s.expires_at>? AND u.active=1', await hash(token), Date.now());
   assert(user, 'Iniciá sesión para continuar.', 401);
+  const validSchools = new Set((await rows(db, 'SELECT id FROM schools')).map(x => x.id));
   if (path === '/api/documents' || path.startsWith('/api/documents/')) {
     role(user, ['superadmin','admin']);
     assert(env.DOCUMENTS, 'Falta configurar el almacenamiento privado de documentos en Cloudflare R2.', 503);
@@ -219,7 +272,7 @@ async function api(request, env) {
         return json({ ok: true });
       }
       if (!documentMatch[2] && method === 'DELETE') {
-        await db.batch([stmt(db, 'DELETE FROM documents WHERE id=?', doc.id), audit(db, user.id, 'document.delete', { id: doc.id })]);
+        await db.batch([stmt(db, 'UPDATE documents SET related_document_id=NULL WHERE related_document_id=?', doc.id), stmt(db, 'DELETE FROM documents WHERE id=?', doc.id), audit(db, user.id, 'document.delete', { id: doc.id })]);
         await env.DOCUMENTS.delete(doc.file_key);
         return json({ ok: true });
       }
@@ -236,14 +289,15 @@ async function api(request, env) {
       FROM clients c JOIN schools s ON s.id=c.school_id LEFT JOIN charges h ON h.client_id=c.id AND h.remaining>0 LEFT JOIN products p ON p.id=h.product_id LEFT JOIN product_school_prices sp ON sp.product_id=h.product_id AND sp.school_id=c.school_id
       WHERE (?='superadmin' OR c.school_id IN (SELECT value FROM json_each(?))) GROUP BY c.id ORDER BY c.name`, user.role, user.school_ids);
     const categories = await rows(db,'SELECT * FROM categories ORDER BY name');
-    const products = await rows(db,'SELECT p.*,c.name AS category_name FROM products p LEFT JOIN categories c ON c.id=p.category_id ORDER BY p.name');
+    const suppliers = await rows(db,'SELECT s.*,(SELECT COUNT(*) FROM products p WHERE p.supplier_id=s.id) AS product_count FROM suppliers s ORDER BY s.name');
+    const products = await rows(db,'SELECT p.*,c.name AS category_name,sp.name AS supplier_name FROM products p LEFT JOIN categories c ON c.id=p.category_id LEFT JOIN suppliers sp ON sp.id=p.supplier_id ORDER BY p.name');
     const schoolPrices = await rows(db,`SELECT product_id,school_id,price FROM product_school_prices WHERE (?='superadmin' OR school_id IN (SELECT value FROM json_each(?)))`,user.role,user.school_ids);
-    return json({ user: publicUser(user), environment: env.APP_ENV, schools: schools.filter(s => user.role === 'superadmin' || JSON.parse(user.school_ids).includes(s.id)), clients, products, categories, school_prices: schoolPrices, settings: JSON.parse((await one(db, 'SELECT data FROM settings WHERE id=1')).data) });
+    return json({ user: publicUser(user), environment: env.APP_ENV, schools: schools.filter(s => user.role === 'superadmin' || JSON.parse(user.school_ids).includes(s.id)), clients, products, categories, suppliers, school_prices: schoolPrices, settings: JSON.parse((await one(db, 'SELECT data FROM settings WHERE id=1')).data) });
   }
   if (path === '/api/clients' && method === 'POST') {
     role(user, ['superadmin','admin','operator']); const b = await body(request);
     const schoolIds=Array.isArray(b.school_ids)?b.school_ids:(b.school_id?[b.school_id]:[]);
-    assert(schoolIds.length>0&&schoolIds.length<=3&&new Set(schoolIds).size===schoolIds.length&&schoolIds.every(s=>['school-1','school-2','school-3'].includes(s)),'Elegí al menos un colegio válido.');
+    assert(schoolIds.length>0&&schoolIds.length<=validSchools.size&&new Set(schoolIds).size===schoolIds.length&&schoolIds.every(s=>validSchools.has(s)),'Elegí al menos un colegio válido.');
     schoolIds.forEach(s=>scope(user,s)); assert(text(b.name), 'Ingresá el nombre.');
     assert(['original','current'].includes(b.mode), 'Criterio inválido.');
     assert(['Familia','Alumno','Personal','Otro'].includes(b.kind), 'Tipo de cliente inválido.');
@@ -251,7 +305,7 @@ async function api(request, env) {
     await db.batch([...schoolIds.map((s,i)=>stmt(db,'INSERT INTO clients(id,name,kind,contact,school_id,mode,created_at,profile_id) VALUES (?,?,?,?,?,?,?,?)',accountIds[i],text(b.name),b.kind,text(b.contact),s,b.mode,created,profileId)),audit(db,user.id,'client.create',{profile_id:profileId,name:text(b.name),schools:schoolIds,mode:b.mode})]);
     return json({ id: accountIds[0], profile_id:profileId, accounts:accountIds.map((id,i)=>({id,school_id:schoolIds[i]})) }, 201);
   }
-  const match = path.match(/^\/api\/clients\/([^/]+)(?:\/(charge|quote|payment|schools))?$/);
+  const match = path.match(/^\/api\/clients\/([^/]+)(?:\/(charge|quote|payment|schools|void|amend))?$/);
   if (match) {
     const client = await account(db, user, match[1]);
     if (!match[2] && method === 'GET') return json(await detail(db, client,Number(url.searchParams.get('offset')||0)));
@@ -262,18 +316,76 @@ async function api(request, env) {
       assert(b.version===client.version,'La cuenta cambió. Volvé a abrir la edición.',409);
       const data={before:{name:client.name,kind:client.kind,contact:client.contact,notes:client.notes,mode:client.mode},after:{name:text(b.name),kind:b.kind,contact:text(b.contact),notes:text(b.notes,1000),mode:b.mode}};
       const key=request.headers.get('Idempotency-Key'),requestHash=await hash(JSON.stringify(b));
-      await commitAccount(db,client,user,key,'profile',data,requestHash,[stmt(db,'UPDATE clients SET name=?,kind=?,contact=?,notes=?,version=version+1 WHERE profile_id=? AND id<>?',data.after.name,data.after.kind,data.after.contact,data.after.notes,client.profile_id||client.id,client.id),stmt(db,'UPDATE clients SET name=?,kind=?,contact=?,notes=?,mode=? WHERE id=?',data.after.name,data.after.kind,data.after.contact,data.after.notes,data.after.mode,client.id)]);
+      await commitAccount(db,client,user,key,'profile',data,requestHash,[stmt(db,'UPDATE clients SET name=?,kind=?,contact=?,notes=?,version=version+1 WHERE profile_id=? AND id<>? AND (?=1 OR school_id IN (SELECT value FROM json_each(?)))',data.after.name,data.after.kind,data.after.contact,data.after.notes,client.profile_id||client.id,client.id,user.role==='superadmin'?1:0,user.school_ids),stmt(db,'UPDATE clients SET name=?,kind=?,contact=?,notes=?,mode=? WHERE id=?',data.after.name,data.after.kind,data.after.contact,data.after.notes,data.after.mode,client.id)]);
       return json({ok:true});
     }
     if(match[2]==='schools'&&method==='POST'){
       role(user,['superadmin','admin','operator']);const b=await body(request),schoolIds=Array.isArray(b.school_ids)?b.school_ids:[];
-      assert(schoolIds.length>0&&schoolIds.length<=3&&new Set(schoolIds).size===schoolIds.length&&schoolIds.every(s=>['school-1','school-2','school-3'].includes(s)),'Elegí al menos un colegio válido.');
+      assert(schoolIds.length>0&&schoolIds.length<=validSchools.size&&new Set(schoolIds).size===schoolIds.length&&schoolIds.every(s=>validSchools.has(s)),'Elegí al menos un colegio válido.');
       schoolIds.forEach(s=>scope(user,s));
       const profileId=client.profile_id||client.id,existing=await rows(db,'SELECT school_id FROM clients WHERE profile_id=?',profileId),known=new Set(existing.map(x=>x.school_id));
       assert(schoolIds.every(s=>!known.has(s)),'Ya existe una cuenta para ese cliente en uno de esos colegios.',409);
       const newAccounts=schoolIds.map(s=>({id:id(),school_id:s})),created=now();
       await db.batch([...newAccounts.map(a=>stmt(db,'INSERT INTO clients(id,name,kind,contact,school_id,mode,credit,version,created_at,notes,profile_id) VALUES (?,?,?,?,?,?,0,0,?,?,?)',a.id,client.name,client.kind,client.contact,a.school_id,client.mode,created,client.notes||'',profileId)),audit(db,user.id,'client.school_account.create',{profile_id:profileId,schools:schoolIds,accounts:newAccounts.map(a=>a.id)})]);
       return json({ok:true,accounts:newAccounts},201);
+    }
+    if (match[2] === 'void' && method === 'POST') {
+      role(user, ['superadmin','admin']);
+      const b = await body(request), key = request.headers.get('Idempotency-Key'), reason = text(b.reason, 300);
+      assert(reason.length >= 3, 'Indicá el motivo de la anulación.');
+      const requestHash = await hash(JSON.stringify({ action: 'void', b }));
+      const old = await one(db, 'SELECT client_id,request_hash FROM events WHERE id=?', key || '');
+      if (old) { assert(old.client_id === client.id && old.request_hash === requestHash, 'Identificador de operación ya utilizado.', 409); return json({ ok: true, repeated: true }); }
+      const target = await one(db, 'SELECT * FROM events WHERE id=? AND client_id=?', String(b.event_id || ''), client.id);
+      assert(target, 'Movimiento no encontrado.', 404);
+      assert(['charge','payment'].includes(target.kind), 'Solo se pueden anular consumos y pagos.');
+      assert(!await one(db, 'SELECT 1 AS x FROM event_voids WHERE target_event_id=?', target.id), 'Ese movimiento ya fue anulado.', 409);
+      const original = JSON.parse(target.data);
+      let statements, credit = client.credit;
+      if (target.kind === 'charge') {
+        const charge = await one(db, 'SELECT * FROM charges WHERE event_id=? AND client_id=?', target.id, client.id);
+        assert(charge, 'No se encontró el consumo original.', 404);
+        assert(charge.remaining === charge.quantity * charge.unit_price, 'El consumo ya tiene pagos aplicados. Anulá primero esos pagos.', 409);
+        statements = [stmt(db, 'UPDATE charges SET remaining=0 WHERE id=? AND remaining=quantity*unit_price', charge.id)];
+      } else {
+        const later = await one(db, `SELECT 1 AS x FROM events e WHERE e.client_id=? AND e.kind='payment' AND e.version>? AND NOT EXISTS (SELECT 1 FROM event_voids v WHERE v.target_event_id=e.id)`, client.id, target.version);
+        assert(!later, 'Hay pagos posteriores. Anulá primero el pago más reciente.', 409);
+        credit = client.credit - original.credit + original.previous_credit;
+        assert(Number.isSafeInteger(credit) && credit >= 0, 'El saldo a favor cambió y no permite anular este pago.', 409);
+        for (const a of original.allocations) {
+          const line = await one(db, 'SELECT quantity,unit_price,remaining FROM charges WHERE id=? AND client_id=?', a.id, client.id);
+          assert(line && line.remaining + a.base <= line.quantity * line.unit_price, 'Un consumo del pago cambió. No se puede anular este pago.', 409);
+        }
+        const encoded = JSON.stringify(original.allocations);
+        statements = [
+          stmt(db, `UPDATE charges SET remaining=remaining+(SELECT json_extract(value,'$.base') FROM json_each(?) WHERE json_extract(value,'$.id')=charges.id) WHERE client_id=? AND id IN (SELECT json_extract(value,'$.id') FROM json_each(?))`, encoded, client.id, encoded),
+          stmt(db, 'UPDATE clients SET credit=? WHERE id=?', credit, client.id)
+        ];
+      }
+      statements.push(stmt(db, 'INSERT INTO event_voids VALUES (?,?,?,?,?)', target.id, key, reason, user.id, now()));
+      await commitAccount(db, client, user, key, 'void', { target_id: target.id, target_kind: target.kind, reason, credit }, requestHash, statements);
+      return json({ ok: true });
+    }
+    if (match[2] === 'amend' && method === 'POST') {
+      role(user, ['superadmin','admin']);
+      const b = await body(request), key = request.headers.get('Idempotency-Key'), reason = text(b.reason, 300);
+      assert(reason.length >= 3, 'Indicá el motivo de la modificación.');
+      const requestHash = await hash(JSON.stringify({ action: 'amend', b }));
+      const old = await one(db, 'SELECT client_id,request_hash FROM events WHERE id=?', key || '');
+      if (old) { assert(old.client_id === client.id && old.request_hash === requestHash, 'Identificador de operación ya utilizado.', 409); return json({ ok: true, repeated: true }); }
+      const target = await one(db, "SELECT * FROM events WHERE id=? AND client_id=? AND kind='charge'", String(b.event_id || ''), client.id);
+      assert(target, 'Consumo no encontrado.', 404);
+      assert(!await one(db, 'SELECT 1 AS x FROM event_voids WHERE target_event_id=?', target.id), 'Ese consumo ya fue anulado o modificado.', 409);
+      const charge = await one(db, 'SELECT * FROM charges WHERE event_id=? AND client_id=?', target.id, client.id);
+      assert(charge, 'No se encontró el consumo original.', 404);
+      assert(charge.remaining === charge.quantity * charge.unit_price, 'El consumo ya tiene pagos aplicados. Anulá primero esos pagos.', 409);
+      const next = await buildCharge(db, user, client, b, JSON.parse(target.data).product_id);
+      await commitAccount(db, client, user, key, 'amend', { target_id: target.id, reason, before: JSON.parse(target.data), after: next }, requestHash, [
+        stmt(db, 'UPDATE charges SET remaining=0 WHERE id=? AND remaining=quantity*unit_price', charge.id),
+        stmt(db, 'INSERT INTO charges VALUES (?,?,?,?,?,?,?,?,?)', next.id, client.id, next.product_id, next.description, next.quantity, next.unit_price, next.total, next.occurred_on, key),
+        stmt(db, 'INSERT INTO event_voids VALUES (?,?,?,?,?)', target.id, key, reason, user.id, now())
+      ]);
+      return json({ ok: true });
     }
     role(user, ['superadmin','admin','operator']); assert(method === 'POST', 'Método no permitido.', 405);
     const b = await body(request), action = match[2], key = request.headers.get('Idempotency-Key');
@@ -283,18 +395,8 @@ async function api(request, env) {
       if (old) { assert(old.client_id === client.id && old.request_hash === requestHash, 'Identificador de operación ya utilizado.', 409); return json({ ok: true, repeated: true }); }
     }
     if (action === 'charge') {
-      assert(Number.isInteger(b.quantity) && b.quantity > 0 && b.quantity <= 1000, 'Cantidad: entre 1 y 1000 unidades.');
-      const product = b.product_id ? await one(db, 'SELECT * FROM products WHERE id=?', b.product_id) : null;
-      assert(!b.product_id || product, 'Producto no encontrado.');
-      const schoolPrice=product?await one(db,'SELECT price FROM product_school_prices WHERE product_id=? AND school_id=?',product.id,client.school_id):null;
-      const effectivePrice=schoolPrice?.price??product?.price;
-      const unitPrice = b.unit_price==null&&product?effectivePrice:cents(b.unit_price); assert(unitPrice > 0, 'El precio debe ser mayor a cero.');
-      if (user.role === 'operator' && product) assert(unitPrice === effectivePrice, 'Solo un administrador puede cargar un precio histórico diferente.', 403);
-      const description = product?.name || text(b.description);
-      assert(description, 'Indicá el concepto.');
-      assert(/^\d{4}-\d{2}-\d{2}$/.test(b.occurred_on || '') && !Number.isNaN(Date.parse(b.occurred_on)) && new Date(b.occurred_on).toISOString().slice(0,10) === b.occurred_on, 'Fecha inválida.');
-      const charge = { id: id(), description, quantity: b.quantity, unit_price: unitPrice, total: unitPrice * b.quantity, product_id: product?.id || null, occurred_on: b.occurred_on };
-      await commitAccount(db, client, user, key, 'charge', charge, requestHash, [stmt(db, 'INSERT INTO charges VALUES (?,?,?,?,?,?,?,?,?)', charge.id, client.id, charge.product_id, description, charge.quantity, unitPrice, charge.total, b.occurred_on, key)]);
+      const charge = await buildCharge(db, user, client, b);
+      await commitAccount(db, client, user, key, 'charge', charge, requestHash, [stmt(db, 'INSERT INTO charges VALUES (?,?,?,?,?,?,?,?,?)', charge.id, client.id, charge.product_id, charge.description, charge.quantity, charge.unit_price, charge.total, charge.occurred_on, key)]);
       return json({ ok: true });
     }
     if (action === 'quote' || action === 'payment') {
@@ -315,9 +417,9 @@ async function api(request, env) {
   }
   if(path==='/api/products/history' && method==='GET'){
     const productId=url.searchParams.get('product');
-    const limit=50,offset=Number(url.searchParams.get('offset')||0);
+    const supplierId=url.searchParams.get('supplier')||null,limit=50,offset=Number(url.searchParams.get('offset')||0);
     assert(Number.isSafeInteger(offset)&&offset>=0,'Página inválida.');
-    return json(await rows(db,`SELECT h.*,p.name AS product_name,u.name AS actor_name,s.name AS school_name FROM (SELECT id,product_id,price,actor,created_at,NULL AS school_id FROM price_history UNION ALL SELECT id,product_id,price,actor,created_at,school_id FROM school_price_history) h JOIN products p ON p.id=h.product_id JOIN users u ON u.id=h.actor LEFT JOIN schools s ON s.id=h.school_id WHERE (? IS NULL OR h.product_id=?) AND (?=1 OR h.school_id IS NULL OR h.school_id IN (SELECT value FROM json_each(?))) ORDER BY h.created_at DESC LIMIT ? OFFSET ?`,productId,productId,user.role==='superadmin'?1:0,user.school_ids,limit,offset));
+    return json(await rows(db,`SELECT h.*,p.name AS product_name,u.name AS actor_name,s.name AS school_name FROM (SELECT id,product_id,price,actor,created_at,NULL AS school_id FROM price_history UNION ALL SELECT id,product_id,price,actor,created_at,school_id FROM school_price_history) h JOIN products p ON p.id=h.product_id JOIN users u ON u.id=h.actor LEFT JOIN schools s ON s.id=h.school_id WHERE (? IS NULL OR h.product_id=?) AND (? IS NULL OR p.supplier_id=?) AND (?=1 OR h.school_id IS NULL OR h.school_id IN (SELECT value FROM json_each(?))) ORDER BY h.created_at DESC LIMIT ? OFFSET ?`,productId,productId,supplierId,supplierId,user.role==='superadmin'?1:0,user.school_ids,limit,offset));
   }
   if(path==='/api/categories'&&method==='POST'){
     role(user,['superadmin','admin']);const b=await body(request),name=text(b.name,80);assert(name,'Ingresá el nombre de la categoría.');
@@ -350,17 +452,67 @@ async function api(request, env) {
       audit(db,user.id,'products.import',{created:plan.create,updated:plan.update,skipped:plan.skip})
     ]);return json({ok:true,created:plan.create,updated:plan.update,skipped:plan.skip});
   }
+  const archiveMatch=path.match(/^\/api\/products\/([^/]+)\/archive$/);
+  if(archiveMatch&&method==='POST'){
+    role(user,['superadmin','admin']);const b=await body(request),product=await one(db,'SELECT * FROM products WHERE id=?',archiveMatch[1]);
+    assert(product,'Producto no encontrado.',404);assert(typeof b.archived==='boolean','Estado inválido.');
+    await catalogCommit(db,user,id(),JSON.stringify({archive:product.id,archived:b.archived}),await catalogVersion(db),[stmt(db,'UPDATE products SET archived_at=?,version=version+1 WHERE id=?',b.archived?now():null,product.id),audit(db,user.id,b.archived?'product.archive':'product.restore',{id:product.id,name:product.name})]);
+    return json({ok:true});
+  }
+  if(path==='/api/products/assign-supplier'&&method==='POST'){
+    role(user,['superadmin','admin']);const b=await body(request);
+    const ids=Array.isArray(b.product_ids)?[...new Set(b.product_ids.map(String))]:[];assert(ids.length>0&&ids.length<=500,'Elegí entre 1 y 500 productos.');
+    const supplierId=text(b.supplier_id)||null;assert(!supplierId||await one(db,'SELECT id FROM suppliers WHERE id=?',supplierId),'Proveedor no encontrado.');
+    const encoded=JSON.stringify(ids);
+    await catalogCommit(db,user,id(),JSON.stringify({assign:ids,supplierId}),await catalogVersion(db),[stmt(db,'UPDATE products SET supplier_id=?,version=version+1 WHERE id IN (SELECT value FROM json_each(?))',supplierId,encoded),audit(db,user.id,'products.assign_supplier',{supplier_id:supplierId,count:ids.length})]);
+    return json({ok:true,count:ids.length});
+  }
+  if(path==='/api/suppliers'&&method==='POST'){
+    role(user,['superadmin','admin']);const b=await body(request),name=text(b.name,80);assert(name,'Ingresá el nombre del proveedor.');
+    try{await db.batch([stmt(db,'INSERT INTO suppliers(id,name,created_at) VALUES (?,?,?)',id(),name,now()),audit(db,user.id,'supplier.create',{name})]);}catch(e){if(/UNIQUE constraint/.test(e.message))assert(false,'Ya existe un proveedor con ese nombre.',409);throw e;}
+    return json({ok:true},201);
+  }
+  const supplierMatch=path.match(/^\/api\/suppliers\/([^/]+)(?:\/(evolution))?$/);
+  if(supplierMatch&&supplierMatch[2]==='evolution'&&method==='GET'){
+    role(user,['superadmin','admin']);
+    const supplier=await one(db,'SELECT * FROM suppliers WHERE id=?',supplierMatch[1]);assert(supplier,'Proveedor no encontrado.',404);
+    const dateOk=v=>!v||/^\d{4}-\d{2}-\d{2}$/.test(v)&&new Date(`${v}T12:00:00Z`).toISOString().slice(0,10)===v;
+    const from=url.searchParams.get('from')||'',to=url.searchParams.get('to')||localDate(Date.now());
+    assert(dateOk(from)&&dateOk(to),'Fecha inválida.');assert(!from||from<=to,'La fecha inicial debe ser anterior a la final.');
+    return json(await supplierEvolution(db,supplier,from,to));
+  }
+  if(supplierMatch&&!supplierMatch[2]&&method==='PUT'){
+    role(user,['superadmin','admin']);const b=await body(request),name=text(b.name,80);assert(name,'Ingresá el nombre del proveedor.');
+    try{const result=await stmt(db,'UPDATE suppliers SET name=? WHERE id=?',name,supplierMatch[1]).run();assert(result.meta.changes,'Proveedor no encontrado.',404);await db.batch([audit(db,user.id,'supplier.rename',{id:supplierMatch[1],name})]);}catch(e){if(/UNIQUE constraint/.test(e.message))assert(false,'Ya existe un proveedor con ese nombre.',409);throw e;}
+    return json({ok:true});
+  }
+  if(path==='/api/audit'&&method==='GET'){
+    role(user,['superadmin','admin']);
+    const q=url.searchParams,offset=Number(q.get('offset')||0),action=q.get('action')||null,actor=q.get('actor')||null,from=q.get('from')||null,to=q.get('to')||null;
+    assert(Number.isSafeInteger(offset)&&offset>=0,'Página inválida.');
+    assert([from,to].every(v=>!v||/^\d{4}-\d{2}-\d{2}$/.test(v)),'Fecha inválida.');
+    const list=await rows(db,`SELECT x.*,u.name AS actor_name FROM (
+      SELECT 'system' AS source,a.id,a.actor,a.action,a.data,a.created_at,NULL AS client_id,NULL AS client_name,NULL AS school_id FROM audit a
+      UNION ALL
+      SELECT 'account',e.id,e.actor,'account.'||e.kind,e.data,e.created_at,c.id,c.name,c.school_id FROM events e JOIN clients c ON c.id=e.client_id
+    ) x LEFT JOIN users u ON u.id=x.actor
+    WHERE (?=1 OR (x.source='account' AND x.school_id IN (SELECT value FROM json_each(?)))) AND (? IS NULL OR x.action=?) AND (? IS NULL OR x.actor=?) AND (? IS NULL OR x.created_at>=?) AND (? IS NULL OR x.created_at<=?)
+    ORDER BY x.created_at DESC,x.id LIMIT 50 OFFSET ?`,user.role==='superadmin'?1:0,user.school_ids,action,action,actor,actor,from&&`${from}T00:00:00.000Z`,from&&`${from}T00:00:00.000Z`,to&&`${to}T23:59:59.999Z`,to&&`${to}T23:59:59.999Z`,offset);
+    const extra=offset===0&&user.role==='superadmin'?{actions:(await rows(db,"SELECT action FROM audit UNION SELECT 'account.'||kind FROM events ORDER BY 1")).map(r=>r.action),actors:await rows(db,'SELECT id,name FROM users ORDER BY name')}:{};
+    return json({offset,rows:list.map(r=>({...r,data:JSON.parse(r.data)})),...extra});
+  }
   if (path === '/api/products' && method === 'POST') {
     role(user, ['superadmin','admin']); const b = await body(request), price = cents(b.price), productId = id();
     assert(text(b.name) && price > 0, 'Completá nombre y precio.');
     const categoryId=text(b.category_id)||null;assert(!categoryId||await one(db,'SELECT id FROM categories WHERE id=?',categoryId),'Categoría no encontrada.');
-    await catalogCommit(db,user,id(),'create',await catalogVersion(db),[stmt(db, 'INSERT INTO products(id,name,price,category_id) VALUES (?,?,?,?)', productId, text(b.name), price,categoryId), stmt(db, 'INSERT INTO price_history(id,product_id,price,actor,created_at) VALUES (?,?,?,?,?)', id(), productId, price, user.id, now())]);
+    const supplierId=text(b.supplier_id)||null;assert(!supplierId||await one(db,'SELECT id FROM suppliers WHERE id=?',supplierId),'Proveedor no encontrado.');
+    await catalogCommit(db,user,id(),'create',await catalogVersion(db),[stmt(db, 'INSERT INTO products(id,name,price,category_id,supplier_id) VALUES (?,?,?,?,?)', productId, text(b.name), price,categoryId,supplierId), stmt(db, 'INSERT INTO price_history(id,product_id,price,actor,created_at) VALUES (?,?,?,?,?)', id(), productId, price, user.id, now()), audit(db, user.id, 'product.create', { id: productId, name: text(b.name), price, category_id: categoryId, supplier_id: supplierId })]);
     return json({ ok: true });
   }
   const schoolPriceMatch=path.match(/^\/api\/products\/([^/]+)\/school-price$/);
   if(schoolPriceMatch&&['POST','DELETE'].includes(method)){
     role(user,['superadmin','admin']);const productId=schoolPriceMatch[1],product=await one(db,'SELECT * FROM products WHERE id=?',productId);assert(product,'Producto no encontrado.',404);
-    const b=method==='POST'?await body(request):{},schoolId=text(b.school_id||url.searchParams.get('school_id'));assert(['school-1','school-2','school-3'].includes(schoolId),'Colegio inválido.');scope(user,schoolId);
+    const b=method==='POST'?await body(request):{},schoolId=text(b.school_id||url.searchParams.get('school_id'));assert(validSchools.has(schoolId),'Colegio inválido.');scope(user,schoolId);
     const existing=await one(db,'SELECT price FROM product_school_prices WHERE product_id=? AND school_id=?',productId,schoolId);assert(method!=='DELETE'||existing,'No hay precio diferencial para restaurar.',404);
     const price=method==='POST'?cents(b.price):product.price;assert(method!=='POST'||price>0,'El precio debe ser mayor a cero.');
     const statements=method==='POST'?[stmt(db,'INSERT INTO product_school_prices(product_id,school_id,price,actor,updated_at) VALUES (?,?,?,?,?) ON CONFLICT(product_id,school_id) DO UPDATE SET price=excluded.price,actor=excluded.actor,updated_at=excluded.updated_at',productId,schoolId,price,user.id,now())]:[stmt(db,'DELETE FROM product_school_prices WHERE product_id=? AND school_id=?',productId,schoolId)];
@@ -372,9 +524,10 @@ async function api(request, env) {
     assert(price===null||price>0,'Precio inválido.');
     const product = await one(db, 'SELECT * FROM products WHERE id=?', productId); assert(product, 'Producto no encontrado.', 404);
     const name=b.name==null?product.name:text(b.name,160),categoryId=b.category_id===undefined?product.category_id:(text(b.category_id)||null);assert(name,'Ingresá el nombre del producto.');assert(!categoryId||await one(db,'SELECT id FROM categories WHERE id=?',categoryId),'Categoría no encontrada.');
-    const statements=[stmt(db,'UPDATE products SET name=?,category_id=?,price=COALESCE(?,price),version=version+1 WHERE id=?',name,categoryId,price,productId)];
+    const supplierId=b.supplier_id===undefined?product.supplier_id:(text(b.supplier_id)||null);assert(!supplierId||await one(db,'SELECT id FROM suppliers WHERE id=?',supplierId),'Proveedor no encontrado.');
+    const statements=[stmt(db,'UPDATE products SET name=?,category_id=?,supplier_id=?,price=COALESCE(?,price),version=version+1 WHERE id=?',name,categoryId,supplierId,price,productId)];
     if(price!==null)statements.push(stmt(db,'INSERT INTO price_history(id,product_id,price,actor,created_at) VALUES (?,?,?,?,?)',id(),productId,price,user.id,now()));
-    statements.push(audit(db,user.id,'product.update',{id:productId,name,category_id:categoryId,price}));
+    statements.push(audit(db,user.id,'product.update',{id:productId,name,category_id:categoryId,supplier_id:supplierId,price}));
     await catalogCommit(db,user,id(),'update',await catalogVersion(db),statements);
     return json({ ok: true });
   }
@@ -383,7 +536,7 @@ async function api(request, env) {
     assert(text(b.name) && /^#[0-9a-f]{6}$/i.test(b.color) && ['system','humanist','serif'].includes(b.font), 'Configuración inválida.');
     assert(!b.logo || /^https:\/\/[^\s]+$/.test(b.logo), 'El logo debe tener una dirección HTTPS.');
     const settings = { name: text(b.name, 60), color: b.color, font: b.font, logo: text(b.logo, 1000), footer: text(b.footer, 300) };
-    assert(Array.isArray(b.schools) && b.schools.length === 3 && new Set(b.schools.map(s => s.id)).size === 3 && b.schools.every(s => ['school-1','school-2','school-3'].includes(s.id) && text(s.name) && (!s.logo || /^https:\/\/[^\s]+$/.test(s.logo)) && /^#[0-9a-f]{6}$/i.test(s.color||'#315ded')), 'Completá los nombres de los tres colegios.');
+    assert(Array.isArray(b.schools) && b.schools.length === validSchools.size && new Set(b.schools.map(s => s.id)).size === validSchools.size && b.schools.every(s => validSchools.has(s.id) && text(s.name) && (!s.logo || /^https:\/\/[^\s]+$/.test(s.logo)) && /^#[0-9a-f]{6}$/i.test(s.color||'#315ded')), 'Completá los nombres de todos los colegios.');
     await db.batch([stmt(db, 'UPDATE settings SET data=? WHERE id=1', JSON.stringify(settings)), ...b.schools.map(s => stmt(db, 'UPDATE schools SET name=?,logo=?,color=? WHERE id=?', text(s.name),text(s.logo,1000),s.color||'#315ded',s.id)), audit(db, user.id, 'settings.update', {...settings,schools:b.schools})]);
     return json({ ok: true });
   }
@@ -396,7 +549,7 @@ async function api(request, env) {
     role(user, ['superadmin','admin']); const b = await body(request);
     assert(text(b.name) && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(text(b.email)), 'Completá nombre y correo.');
     assert(['superadmin','admin','operator','viewer'].includes(b.role), 'Rol inválido.');
-    assert(Array.isArray(b.school_ids) && b.school_ids.every(s => ['school-1','school-2','school-3'].includes(s)) && (b.role === 'superadmin' || b.school_ids.length), 'Asigná al menos un colegio.');
+    assert(Array.isArray(b.school_ids) && b.school_ids.every(s => validSchools.has(s)) && (b.role === 'superadmin' || b.school_ids.length), 'Asigná al menos un colegio.');
     assert(typeof b.password === 'string' && b.password.length >= 12 && b.password.length <= 128, 'Usá una contraseña de 12 a 128 caracteres.');
     manageUser(user,{role:b.role,school_ids:JSON.stringify(b.school_ids)});
     const userId = id();
@@ -410,7 +563,7 @@ async function api(request, env) {
     next.school_ids=b.school_ids??JSON.parse(old.school_ids);
     assert(text(next.name)&&/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(text(next.email)),'Completá nombre y correo.');
     assert(['superadmin','admin','operator','viewer'].includes(next.role),'Rol inválido.');
-    assert(Array.isArray(next.school_ids)&&next.school_ids.every(s=>['school-1','school-2','school-3'].includes(s))&&(next.role==='superadmin'||next.school_ids.length),'Asigná colegios válidos.');
+    assert(Array.isArray(next.school_ids)&&next.school_ids.every(s=>validSchools.has(s))&&(next.role==='superadmin'||next.school_ids.length),'Asigná colegios válidos.');
     manageUser(user,{role:next.role,school_ids:JSON.stringify(next.school_ids)});
     const active=b.active===undefined?Boolean(old.active):b.active;assert(typeof active==='boolean','Estado inválido.');
     assert(target!==user.id||(active&&next.role===old.role),'No podés desactivar o cambiar tu propio nivel.');
@@ -438,7 +591,7 @@ export default {
       response = json({ error: error.status ? error.message : conflict ? 'Ese registro ya existe. Actualizá la pantalla.' : 'No se pudo completar la operación. Revisá la configuración o intentá nuevamente.' }, error.status || (conflict ? 409 : 500));
     }
     response = new Response(response.body, response);
-    response.headers.set('Cache-Control', 'no-store');
+    response.headers.set('Cache-Control', new URL(request.url).pathname.startsWith('/api/') ? 'no-store' : 'no-cache');
     response.headers.set('X-Content-Type-Options', 'nosniff');
     response.headers.set('Referrer-Policy', 'same-origin');
     response.headers.set('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' https: data:; connect-src 'self'; worker-src 'self' blob:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");

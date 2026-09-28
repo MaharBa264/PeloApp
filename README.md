@@ -1,6 +1,6 @@
 # PeloApp
 
-Cuentas corrientes para tres kioscos escolares. Interfaz luminosa adaptable a celular y PC. Versión **0.3.0 de piloto**, con comparación de precios al adquirir y al pagar, anticipos, permisos por colegio e ingreso de documentos desde fotos como borradores revisables.
+Cuentas corrientes para tres kioscos escolares. Interfaz luminosa adaptable a celular y PC. Versión **0.4.0 de piloto**, con anulación y modificación de consumos, productos archivables, proveedores con evolución de precios, auditoría y comparación de precios al adquirir y al pagar, anticipos, permisos por colegio e ingreso de documentos desde fotos como borradores revisables.
 
 ## Estado
 
