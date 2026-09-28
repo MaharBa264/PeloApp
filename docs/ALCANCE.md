@@ -63,3 +63,11 @@ Probar con datos ficticios en dev. El SQL y las pruebas de integración locales 
 - Los datos se pueden corregir, agregar/quitar renglones, y vincular documentos relacionados (por ejemplo, remito y factura). Se puede eliminar el borrador junto con su imagen.
 - Esta etapa es una bandeja de revisión: guardar un borrador **no contabiliza compras, no cambia precios de venta ni mueve stock**. Esos movimientos requieren definir el circuito de compras y reparto entre colegios.
 - La imagen se procesa con Cloudflare Workers AI para extraer datos. Evitar subir información que no corresponda a la gestión de estos kioscos.
+
+## Ampliación 0.4.0 · Catálogo y cuentas por colegio
+
+- Categorías compartidas, asignables a productos, renombrables y filtrables; búsqueda por producto o categoría.
+- Carga rápida de consumo desde Cuentas corrientes y desde cada cliente, con búsqueda de cuenta y producto.
+- Catálogo general compartido con precios diferenciales por colegio. Cada consumo conserva el precio aplicado; la deuda pendiente se compara contra el precio vigente de su colegio.
+- Un cliente puede tener cuenta en varios colegios: se comparte su ficha, pero cada colegio conserva una cuenta, saldo, consumos, pagos y criterio de cobro independientes.
+- La migración 0004 agrega los vínculos y precios sin reescribir consumos, pagos ni el historial general existente.
