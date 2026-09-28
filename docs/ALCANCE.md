@@ -15,6 +15,7 @@ Cuentas corrientes de tres kioscos escolares. Interfaz luminosa adaptable a celu
 - Vista previa obligatoria del cobro, pagos parciales FIFO y anticipos en pesos.
 - Movimientos con fecha, responsable, aplicación a consumos y ajuste de precio.
 - Operaciones financieras atómicas, bloqueo optimista e identificador para reintentos.
+- Anulación de consumos y pagos (administradores) con motivo obligatorio. El movimiento no se borra: queda tachado y se registra una anulación. Un consumo solo se anula si no tiene pagos aplicados; un pago solo si es el más reciente de la cuenta (restituye los consumos y el anticipo previo).
 - Usuarios activos/inactivos y colegios asignados; personalización por superadministrador.
 - Resumen imprimible mediante navegador (también guardar PDF).
 
@@ -29,7 +30,6 @@ Al confirmar un cobro se emplea el precio revisado por el servidor; si la cuenta
 ## Pendientes para ampliar el piloto
 
 - Alumnos vinculados estructurados, selección manual de ítems a cancelar y límites de crédito.
-- Reversión/anulación formal de movimientos con motivo; no editar saldos directamente para corregir errores.
 - Recuperación de acceso por correo (ya se puede restablecer contraseña desde Usuarios).
 - Cuentas de proveedores separadas de clientes y circuito compra/remito/factura/pago.
 - Exportaciones estructuradas, respaldos externos en Drive y reportes Sheets. No están conectados todavía.

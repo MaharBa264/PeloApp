@@ -41,8 +41,8 @@ async function pending(db, clientId) {
 async function detail(db, client, offset=0) {
   assert(Number.isSafeInteger(offset)&&offset>=0,'Página inválida.');
   const lines = await pending(db, client.id);
-  const events = await rows(db, 'SELECT e.*,u.name AS actor_name FROM events e JOIN users u ON u.id=e.actor WHERE client_id=? ORDER BY version DESC LIMIT 50 OFFSET ?', client.id,offset);
-  return { client, offset, lines: lines.map(l => ({ ...l, current_value: valueOf(l, 'current') })), events: events.map(e => ({ ...e, data: JSON.parse(e.data) })) };
+  const events = await rows(db, 'SELECT e.*,u.name AS actor_name,(v.target_event_id IS NOT NULL) AS voided FROM events e JOIN users u ON u.id=e.actor LEFT JOIN event_voids v ON v.target_event_id=e.id WHERE client_id=? ORDER BY version DESC LIMIT 50 OFFSET ?', client.id,offset);
+  return { client, offset, lines: lines.map(l => ({ ...l, current_value: valueOf(l, 'current') })), events: events.map(e => ({ ...e, voided: Boolean(e.voided), data: JSON.parse(e.data) })) };
 }
 async function commitAccount(db, client, user, key, kind, data, requestHash, statements) {
   assert(/^[a-zA-Z0-9-]{16,80}$/.test(key || ''), 'Falta el identificador de operación.');
@@ -251,7 +251,7 @@ async function api(request, env) {
     await db.batch([...schoolIds.map((s,i)=>stmt(db,'INSERT INTO clients(id,name,kind,contact,school_id,mode,created_at,profile_id) VALUES (?,?,?,?,?,?,?,?)',accountIds[i],text(b.name),b.kind,text(b.contact),s,b.mode,created,profileId)),audit(db,user.id,'client.create',{profile_id:profileId,name:text(b.name),schools:schoolIds,mode:b.mode})]);
     return json({ id: accountIds[0], profile_id:profileId, accounts:accountIds.map((id,i)=>({id,school_id:schoolIds[i]})) }, 201);
   }
-  const match = path.match(/^\/api\/clients\/([^/]+)(?:\/(charge|quote|payment|schools))?$/);
+  const match = path.match(/^\/api\/clients\/([^/]+)(?:\/(charge|quote|payment|schools|void))?$/);
   if (match) {
     const client = await account(db, user, match[1]);
     if (!match[2] && method === 'GET') return json(await detail(db, client,Number(url.searchParams.get('offset')||0)));
@@ -274,6 +274,43 @@ async function api(request, env) {
       const newAccounts=schoolIds.map(s=>({id:id(),school_id:s})),created=now();
       await db.batch([...newAccounts.map(a=>stmt(db,'INSERT INTO clients(id,name,kind,contact,school_id,mode,credit,version,created_at,notes,profile_id) VALUES (?,?,?,?,?,?,0,0,?,?,?)',a.id,client.name,client.kind,client.contact,a.school_id,client.mode,created,client.notes||'',profileId)),audit(db,user.id,'client.school_account.create',{profile_id:profileId,schools:schoolIds,accounts:newAccounts.map(a=>a.id)})]);
       return json({ok:true,accounts:newAccounts},201);
+    }
+    if (match[2] === 'void' && method === 'POST') {
+      role(user, ['superadmin','admin']);
+      const b = await body(request), key = request.headers.get('Idempotency-Key'), reason = text(b.reason, 300);
+      assert(reason.length >= 3, 'Indicá el motivo de la anulación.');
+      const requestHash = await hash(JSON.stringify({ action: 'void', b }));
+      const old = await one(db, 'SELECT client_id,request_hash FROM events WHERE id=?', key || '');
+      if (old) { assert(old.client_id === client.id && old.request_hash === requestHash, 'Identificador de operación ya utilizado.', 409); return json({ ok: true, repeated: true }); }
+      const target = await one(db, 'SELECT * FROM events WHERE id=? AND client_id=?', String(b.event_id || ''), client.id);
+      assert(target, 'Movimiento no encontrado.', 404);
+      assert(['charge','payment'].includes(target.kind), 'Solo se pueden anular consumos y pagos.');
+      assert(!await one(db, 'SELECT 1 AS x FROM event_voids WHERE target_event_id=?', target.id), 'Ese movimiento ya fue anulado.', 409);
+      const original = JSON.parse(target.data);
+      let statements, credit = client.credit;
+      if (target.kind === 'charge') {
+        const charge = await one(db, 'SELECT * FROM charges WHERE event_id=? AND client_id=?', target.id, client.id);
+        assert(charge, 'No se encontró el consumo original.', 404);
+        assert(charge.remaining === charge.quantity * charge.unit_price, 'El consumo ya tiene pagos aplicados. Anulá primero esos pagos.', 409);
+        statements = [stmt(db, 'UPDATE charges SET remaining=0 WHERE id=? AND remaining=quantity*unit_price', charge.id)];
+      } else {
+        const later = await one(db, `SELECT 1 AS x FROM events e WHERE e.client_id=? AND e.kind='payment' AND e.version>? AND NOT EXISTS (SELECT 1 FROM event_voids v WHERE v.target_event_id=e.id)`, client.id, target.version);
+        assert(!later, 'Hay pagos posteriores. Anulá primero el pago más reciente.', 409);
+        credit = client.credit - original.credit + original.previous_credit;
+        assert(Number.isSafeInteger(credit) && credit >= 0, 'El saldo a favor cambió y no permite anular este pago.', 409);
+        for (const a of original.allocations) {
+          const line = await one(db, 'SELECT quantity,unit_price,remaining FROM charges WHERE id=? AND client_id=?', a.id, client.id);
+          assert(line && line.remaining + a.base <= line.quantity * line.unit_price, 'Un consumo del pago cambió. No se puede anular este pago.', 409);
+        }
+        const encoded = JSON.stringify(original.allocations);
+        statements = [
+          stmt(db, `UPDATE charges SET remaining=remaining+(SELECT json_extract(value,'$.base') FROM json_each(?) WHERE json_extract(value,'$.id')=charges.id) WHERE client_id=? AND id IN (SELECT json_extract(value,'$.id') FROM json_each(?))`, encoded, client.id, encoded),
+          stmt(db, 'UPDATE clients SET credit=? WHERE id=?', credit, client.id)
+        ];
+      }
+      statements.push(stmt(db, 'INSERT INTO event_voids VALUES (?,?,?,?,?)', target.id, key, reason, user.id, now()));
+      await commitAccount(db, client, user, key, 'void', { target_id: target.id, target_kind: target.kind, reason, credit }, requestHash, statements);
+      return json({ ok: true });
     }
     role(user, ['superadmin','admin','operator']); assert(method === 'POST', 'Método no permitido.', 405);
     const b = await body(request), action = match[2], key = request.headers.get('Idempotency-Key');
