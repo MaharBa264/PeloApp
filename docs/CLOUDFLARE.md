@@ -18,6 +18,8 @@ Antes del siguiente despliegue, crear dos buckets desde Cloudflare → R2 Object
 
 Dejarlos privados: no habilitar acceso público ni dominio personalizado. `wrangler.jsonc` los enlaza al Worker correspondiente. El Worker verifica sesión y rol antes de guardar o mostrar una imagen. La binding de Workers AI `AI` no usa un token; el código invoca `@cf/moondream/moondream3.1-9B-A2B` para leer una propuesta desde la foto.
 
+Estado al 28/09/2026: el propietario confirmó que ambos buckets ya fueron creados. La rama `dev` se usa para completar y probar el despliegue antes de publicar cambios en producción.
+
 Workers AI tiene una cuota gratuita diaria; al agotarse, la app igual guarda el documento como borrador manual para que se complete sin OCR. Revisar la cuota y las condiciones vigentes en Cloudflare antes de cargar documentos reales.
 
 ## Primero: entorno de pruebas
