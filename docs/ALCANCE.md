@@ -17,6 +17,11 @@ Cuentas corrientes de tres kioscos escolares. Interfaz luminosa adaptable a celu
 - Operaciones financieras atómicas, bloqueo optimista e identificador para reintentos.
 - Anulación de consumos y pagos (administradores) con motivo obligatorio. El movimiento no se borra: queda tachado y se registra una anulación. Un consumo solo se anula si no tiene pagos aplicados; un pago solo si es el más reciente de la cuenta (restituye los consumos y el anticipo previo).
 - Modificación de consumos (administradores) con motivo: el original queda marcado como modificado y se registra el nuevo, con "antes" y "ahora". Mismas reglas que la anulación: sin pagos aplicados.
+- Productos archivables (no se borran): dejan de ofrecerse al cargar consumos y aparecen en el filtro "Archivados"; las cuentas y el historial de precios no cambian. Un consumo existente conserva su producto archivado al modificarse.
+- Proveedores: catálogo de proveedores, asignación individual o masiva de productos y pantalla de evolución de precios por proveedor (variación promedio, índice base 100, cambios por producto). Usa el precio general, no los precios por colegio.
+- Auditoría (superadministrador: todo; administrador: movimientos de cuentas de sus colegios) con filtros por acción, persona y fechas.
+- Fechas de consumo limitadas a 2020 hasta mañana; los colegios se validan contra la base de datos.
+- Aplicación instalable (service worker mínimo sin caché de datos) y archivos estáticos revalidados en vez de descargados siempre.
 - Usuarios activos/inactivos y colegios asignados; personalización por superadministrador.
 - Resumen imprimible mediante navegador (también guardar PDF).
 
