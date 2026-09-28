@@ -36,7 +36,7 @@ async function account(db, user, clientId) {
   assert(client, 'Cuenta no encontrada.', 404); scope(user, client.school_id); return client;
 }
 async function pending(db, clientId) {
-  return rows(db, 'SELECT c.*,p.price AS current_price FROM charges c LEFT JOIN products p ON p.id=c.product_id WHERE c.client_id=? AND c.remaining>0 ORDER BY c.occurred_on,c.id', clientId);
+  return rows(db, 'SELECT c.*,COALESCE(sp.price,p.price) AS current_price FROM charges c LEFT JOIN products p ON p.id=c.product_id JOIN clients a ON a.id=c.client_id LEFT JOIN product_school_prices sp ON sp.product_id=c.product_id AND sp.school_id=a.school_id WHERE c.client_id=? AND c.remaining>0 ORDER BY c.occurred_on,c.id', clientId);
 }
 async function detail(db, client, offset=0) {
   assert(Number.isSafeInteger(offset)&&offset>=0,'Página inválida.');
@@ -77,6 +77,56 @@ async function rateLimit(db, request) {
   assert(recent.n < 15, 'Demasiados intentos. Esperá 15 minutos.', 429);
   await db.batch([stmt(db, 'INSERT INTO auth_attempts VALUES (?,?,?)', id(), ip, Date.now()), stmt(db, 'DELETE FROM auth_attempts WHERE at<?', since)]);
 }
+const documentTypes = ['invoice','delivery_note','order','other'];
+function normalizeDocumentData(value) {
+  const data = value && typeof value === 'object' ? value : {};
+  const lines = Array.isArray(data.lines) ? data.lines.slice(0, 150).map(line => ({
+    code: text(line?.code, 80), description: text(line?.description, 180),
+    quantity: String(line?.quantity ?? '').slice(0, 32), unit: text(line?.unit, 32),
+    unit_price: String(line?.unit_price ?? '').slice(0, 32), line_total: String(line?.line_total ?? '').slice(0, 32)
+  })) : [];
+  return {
+    document_type: documentTypes.includes(data.document_type) ? data.document_type : 'other',
+    supplier: text(data.supplier, 180), document_number: text(data.document_number, 100),
+    document_date: /^\d{4}-\d{2}-\d{2}$/.test(data.document_date || '') ? data.document_date : '',
+    total: String(data.total ?? '').slice(0, 32), notes: text(data.notes, 1000), lines
+  };
+}
+function validDocumentDate(value) {
+  return !value || /^\d{4}-\d{2}-\d{2}$/.test(value) && !Number.isNaN(Date.parse(`${value}T12:00:00Z`)) && new Date(`${value}T12:00:00Z`).toISOString().slice(0,10) === value;
+}
+function parseDocumentAnswer(answer) {
+  if (typeof answer !== 'string') return null;
+  const start = answer.indexOf('{'), end = answer.lastIndexOf('}');
+  if (start < 0 || end <= start) return null;
+  try { const result = JSON.parse(answer.slice(start, end + 1)); return result && typeof result === 'object' ? result : null; } catch { return null; }
+}
+function base64(data) {
+  let binary = '';
+  for (let start = 0; start < data.length; start += 0x8000) binary += String.fromCharCode(...data.subarray(start, start + 0x8000));
+  return btoa(binary);
+}
+function hasImageSignature(data, type) {
+  if (type === 'image/jpeg') return data[0] === 0xff && data[1] === 0xd8 && data[2] === 0xff;
+  if (type === 'image/png') return data[0] === 0x89 && data[1] === 0x50 && data[2] === 0x4e && data[3] === 0x47;
+  if (type === 'image/webp') return String.fromCharCode(...data.subarray(0,4)) === 'RIFF' && String.fromCharCode(...data.subarray(8,12)) === 'WEBP';
+  return false;
+}
+async function extractDocument(env, data, type, requestedType) {
+  if (!env.AI) return { status: 'unavailable', data: normalizeDocumentData({ document_type: requestedType }) };
+  try {
+    const answer = await env.AI.run('@cf/moondream/moondream3.1-9B-A2B', {
+      task: 'query', image: `data:${type};base64,${base64(data)}`, reasoning: false,
+      temperature: 0, max_tokens: 4096,
+      question: `Leé esta foto de un documento comercial argentino. Devolvé SOLO un objeto JSON válido, sin texto ni Markdown, con este formato: {"document_type":"invoice|delivery_note|order|other","supplier":"","document_number":"","document_date":"YYYY-MM-DD o vacío","total":"","notes":"anotaciones visibles","lines":[{"code":"","description":"","quantity":"","unit":"","unit_price":"","line_total":""}]}. Transcribí lo legible sin inventar valores. Conservá importes como texto tal como aparecen. Si un dato no se lee, dejalo vacío. Tipo sugerido: ${requestedType}.`
+    });
+    const parsed = parseDocumentAnswer(answer?.answer);
+    return parsed ? { status: 'review', data: normalizeDocumentData(parsed) } : { status: 'error', data: normalizeDocumentData({ document_type: requestedType }) };
+  } catch (error) {
+    console.error('document_ai_failed', error?.name || 'Error');
+    return { status: 'error', data: normalizeDocumentData({ document_type: requestedType }) };
+  }
+}
 async function api(request, env) {
   const db = env.DB, url = new URL(request.url), path = url.pathname, method = request.method;
   assert(db, 'Falta vincular la base D1.', 503);
@@ -114,6 +164,67 @@ async function api(request, env) {
   const token = (request.headers.get('Cookie') || '').match(/(?:^|;\s*)pelo_session=([^;]+)/)?.[1] || '';
   const user = await one(db, 'SELECT u.* FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token=? AND s.expires_at>? AND u.active=1', await hash(token), Date.now());
   assert(user, 'Iniciá sesión para continuar.', 401);
+  if (path === '/api/documents' || path.startsWith('/api/documents/')) {
+    role(user, ['superadmin','admin']);
+    assert(env.DOCUMENTS, 'Falta configurar el almacenamiento privado de documentos en Cloudflare R2.', 503);
+    if (path === '/api/documents' && method === 'GET') {
+      return json(await rows(db, `SELECT id,document_type,status,supplier,document_number,document_date,related_document_id,file_type,file_size,ai_status,reviewed,reviewed_at,actor,created_at,updated_at FROM documents ORDER BY created_at DESC LIMIT 100`));
+    }
+    if (path === '/api/documents' && method === 'POST') {
+      const length = Number(request.headers.get('Content-Length') || 0);
+      assert(!length || length <= 3_500_000, 'La imagen debe pesar menos de 3 MB.', 413);
+      assert((request.headers.get('Content-Type') || '').startsWith('multipart/form-data'), 'Subí una foto del documento.', 415);
+      const form = await request.formData(), file = form.get('file'), requestedType = String(form.get('document_type') || 'other');
+      assert(file instanceof File && file.size > 0 && file.size <= 3 * 1024 * 1024, 'Elegí una imagen de hasta 3 MB.', 413);
+      assert(documentTypes.includes(requestedType), 'Tipo de documento inválido.');
+      const type = String(file.type || '').toLowerCase();
+      assert(['image/jpeg','image/png','image/webp'].includes(type), 'Usá una foto JPG, PNG o WebP.');
+      const image = new Uint8Array(await file.arrayBuffer());
+      assert(hasImageSignature(image, type), 'El archivo no coincide con el formato de imagen declarado.');
+      const documentId = id(), fileKey = `documents/${documentId}`;
+      await env.DOCUMENTS.put(fileKey, image, { httpMetadata: { contentType: type, cacheControl: 'private, no-store' } });
+      const extracted = await extractDocument(env, image, type, requestedType), data = extracted.data;
+      const date = now();
+      try {
+        await db.batch([
+          stmt(db, 'INSERT INTO documents(id,document_type,supplier,document_number,document_date,file_key,file_type,file_size,ai_status,data,actor,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)', documentId, data.document_type, data.supplier, data.document_number, data.document_date, fileKey, type, image.length, extracted.status, JSON.stringify(data), user.id, date, date),
+          audit(db, user.id, 'document.upload', { id: documentId, document_type: data.document_type, ai_status: extracted.status, size: image.length })
+        ]);
+      } catch (error) { await env.DOCUMENTS.delete(fileKey); throw error; }
+      return json({ id: documentId, document_type: data.document_type, ai_status: extracted.status, data }, 201);
+    }
+      const documentMatch = path.match(/^\/api\/documents\/([^/]+)(?:\/(image))?$/);
+    if (documentMatch) {
+      const doc = await one(db, 'SELECT * FROM documents WHERE id=?', documentMatch[1]);
+      assert(doc, 'Documento no encontrado.', 404);
+      if (!documentMatch[2] && method === 'GET') {
+        const { file_key, ...safe } = doc;
+        return json({ ...safe, data: JSON.parse(doc.data) });
+      }
+      if (documentMatch[2] === 'image' && method === 'GET') {
+        const object = await env.DOCUMENTS.get(doc.file_key); assert(object, 'La imagen original no está disponible.', 404);
+        return new Response(object.body, { headers: { 'Content-Type': doc.file_type, 'Content-Length': String(doc.file_size), 'Cache-Control': 'private, no-store', 'Content-Disposition': 'inline' } });
+      }
+      if (!documentMatch[2] && method === 'PUT') {
+        const b = await body(request), data = normalizeDocumentData(b.data);
+        assert(documentTypes.includes(data.document_type), 'Tipo de documento inválido.');
+        assert(validDocumentDate(data.document_date), 'Fecha inválida.');
+        const related = text(b.related_document_id, 80);
+        assert(!related || related !== doc.id && await one(db, 'SELECT id FROM documents WHERE id=?', related), 'Documento relacionado inválido.');
+        const date = now();
+        await db.batch([
+          stmt(db, 'UPDATE documents SET document_type=?,supplier=?,document_number=?,document_date=?,related_document_id=?,data=?,reviewed=1,reviewed_at=?,updated_at=? WHERE id=?', data.document_type, data.supplier, data.document_number, data.document_date, related || null, JSON.stringify(data), date, date, doc.id),
+          audit(db, user.id, 'document.review', { id: doc.id, related_document_id: related || null, lines: data.lines.length })
+        ]);
+        return json({ ok: true });
+      }
+      if (!documentMatch[2] && method === 'DELETE') {
+        await db.batch([stmt(db, 'DELETE FROM documents WHERE id=?', doc.id), audit(db, user.id, 'document.delete', { id: doc.id })]);
+        await env.DOCUMENTS.delete(doc.file_key);
+        return json({ ok: true });
+      }
+    }
+  }
   if (path === '/api/logout' && method === 'POST') {
     await stmt(db, 'DELETE FROM sessions WHERE token=?', await hash(token)).run();
     return json({ ok: true }, 200, { 'Set-Cookie': 'pelo_session=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0' });
@@ -121,21 +232,26 @@ async function api(request, env) {
   if (path === '/api/data' && method === 'GET') {
     const schools = await rows(db, 'SELECT * FROM schools ORDER BY id');
     const clients = await rows(db, `SELECT c.*,s.name AS school_name,COALESCE(SUM(h.remaining),0) AS original_due,
-      COALESCE(SUM(CASE WHEN h.product_id IS NULL THEN h.remaining ELSE CAST(ROUND(h.remaining*1.0*p.price/h.unit_price) AS INTEGER) END),0) AS current_due
-      FROM clients c JOIN schools s ON s.id=c.school_id LEFT JOIN charges h ON h.client_id=c.id AND h.remaining>0 LEFT JOIN products p ON p.id=h.product_id
+      COALESCE(SUM(CASE WHEN h.product_id IS NULL THEN h.remaining ELSE CAST(ROUND(h.remaining*1.0*COALESCE(sp.price,p.price)/h.unit_price) AS INTEGER) END),0) AS current_due
+      FROM clients c JOIN schools s ON s.id=c.school_id LEFT JOIN charges h ON h.client_id=c.id AND h.remaining>0 LEFT JOIN products p ON p.id=h.product_id LEFT JOIN product_school_prices sp ON sp.product_id=h.product_id AND sp.school_id=c.school_id
       WHERE (?='superadmin' OR c.school_id IN (SELECT value FROM json_each(?))) GROUP BY c.id ORDER BY c.name`, user.role, user.school_ids);
-    return json({ user: publicUser(user), environment: env.APP_ENV, schools: schools.filter(s => user.role === 'superadmin' || JSON.parse(user.school_ids).includes(s.id)), clients, products: await rows(db, 'SELECT * FROM products ORDER BY name'), settings: JSON.parse((await one(db, 'SELECT data FROM settings WHERE id=1')).data) });
+    const categories = await rows(db,'SELECT * FROM categories ORDER BY name');
+    const products = await rows(db,'SELECT p.*,c.name AS category_name FROM products p LEFT JOIN categories c ON c.id=p.category_id ORDER BY p.name');
+    const schoolPrices = await rows(db,`SELECT product_id,school_id,price FROM product_school_prices WHERE (?='superadmin' OR school_id IN (SELECT value FROM json_each(?)))`,user.role,user.school_ids);
+    return json({ user: publicUser(user), environment: env.APP_ENV, schools: schools.filter(s => user.role === 'superadmin' || JSON.parse(user.school_ids).includes(s.id)), clients, products, categories, school_prices: schoolPrices, settings: JSON.parse((await one(db, 'SELECT data FROM settings WHERE id=1')).data) });
   }
   if (path === '/api/clients' && method === 'POST') {
     role(user, ['superadmin','admin','operator']); const b = await body(request);
-    scope(user, b.school_id); assert(text(b.name), 'Ingresá el nombre.');
+    const schoolIds=Array.isArray(b.school_ids)?b.school_ids:(b.school_id?[b.school_id]:[]);
+    assert(schoolIds.length>0&&schoolIds.length<=3&&new Set(schoolIds).size===schoolIds.length&&schoolIds.every(s=>['school-1','school-2','school-3'].includes(s)),'Elegí al menos un colegio válido.');
+    schoolIds.forEach(s=>scope(user,s)); assert(text(b.name), 'Ingresá el nombre.');
     assert(['original','current'].includes(b.mode), 'Criterio inválido.');
     assert(['Familia','Alumno','Personal','Otro'].includes(b.kind), 'Tipo de cliente inválido.');
-    const clientId = id();
-    await db.batch([stmt(db, 'INSERT INTO clients(id,name,kind,contact,school_id,mode,created_at) VALUES (?,?,?,?,?,?,?)', clientId, text(b.name), b.kind, text(b.contact), b.school_id, b.mode, now()), audit(db, user.id, 'client.create', { id: clientId, name: text(b.name), school: b.school_id, mode: b.mode })]);
-    return json({ id: clientId }, 201);
+    const profileId=id(), created=now(), accountIds=schoolIds.map(()=>id());
+    await db.batch([...schoolIds.map((s,i)=>stmt(db,'INSERT INTO clients(id,name,kind,contact,school_id,mode,created_at,profile_id) VALUES (?,?,?,?,?,?,?,?)',accountIds[i],text(b.name),b.kind,text(b.contact),s,b.mode,created,profileId)),audit(db,user.id,'client.create',{profile_id:profileId,name:text(b.name),schools:schoolIds,mode:b.mode})]);
+    return json({ id: accountIds[0], profile_id:profileId, accounts:accountIds.map((id,i)=>({id,school_id:schoolIds[i]})) }, 201);
   }
-  const match = path.match(/^\/api\/clients\/([^/]+)(?:\/(charge|quote|payment))?$/);
+  const match = path.match(/^\/api\/clients\/([^/]+)(?:\/(charge|quote|payment|schools))?$/);
   if (match) {
     const client = await account(db, user, match[1]);
     if (!match[2] && method === 'GET') return json(await detail(db, client,Number(url.searchParams.get('offset')||0)));
@@ -146,8 +262,18 @@ async function api(request, env) {
       assert(b.version===client.version,'La cuenta cambió. Volvé a abrir la edición.',409);
       const data={before:{name:client.name,kind:client.kind,contact:client.contact,notes:client.notes,mode:client.mode},after:{name:text(b.name),kind:b.kind,contact:text(b.contact),notes:text(b.notes,1000),mode:b.mode}};
       const key=request.headers.get('Idempotency-Key'),requestHash=await hash(JSON.stringify(b));
-      await commitAccount(db,client,user,key,'profile',data,requestHash,[stmt(db,'UPDATE clients SET name=?,kind=?,contact=?,notes=?,mode=? WHERE id=?',data.after.name,data.after.kind,data.after.contact,data.after.notes,data.after.mode,client.id)]);
+      await commitAccount(db,client,user,key,'profile',data,requestHash,[stmt(db,'UPDATE clients SET name=?,kind=?,contact=?,notes=?,version=version+1 WHERE profile_id=? AND id<>?',data.after.name,data.after.kind,data.after.contact,data.after.notes,client.profile_id||client.id,client.id),stmt(db,'UPDATE clients SET name=?,kind=?,contact=?,notes=?,mode=? WHERE id=?',data.after.name,data.after.kind,data.after.contact,data.after.notes,data.after.mode,client.id)]);
       return json({ok:true});
+    }
+    if(match[2]==='schools'&&method==='POST'){
+      role(user,['superadmin','admin','operator']);const b=await body(request),schoolIds=Array.isArray(b.school_ids)?b.school_ids:[];
+      assert(schoolIds.length>0&&schoolIds.length<=3&&new Set(schoolIds).size===schoolIds.length&&schoolIds.every(s=>['school-1','school-2','school-3'].includes(s)),'Elegí al menos un colegio válido.');
+      schoolIds.forEach(s=>scope(user,s));
+      const profileId=client.profile_id||client.id,existing=await rows(db,'SELECT school_id FROM clients WHERE profile_id=?',profileId),known=new Set(existing.map(x=>x.school_id));
+      assert(schoolIds.every(s=>!known.has(s)),'Ya existe una cuenta para ese cliente en uno de esos colegios.',409);
+      const newAccounts=schoolIds.map(s=>({id:id(),school_id:s})),created=now();
+      await db.batch([...newAccounts.map(a=>stmt(db,'INSERT INTO clients(id,name,kind,contact,school_id,mode,credit,version,created_at,notes,profile_id) VALUES (?,?,?,?,?,?,0,0,?,?,?)',a.id,client.name,client.kind,client.contact,a.school_id,client.mode,created,client.notes||'',profileId)),audit(db,user.id,'client.school_account.create',{profile_id:profileId,schools:schoolIds,accounts:newAccounts.map(a=>a.id)})]);
+      return json({ok:true,accounts:newAccounts},201);
     }
     role(user, ['superadmin','admin','operator']); assert(method === 'POST', 'Método no permitido.', 405);
     const b = await body(request), action = match[2], key = request.headers.get('Idempotency-Key');
@@ -160,8 +286,10 @@ async function api(request, env) {
       assert(Number.isInteger(b.quantity) && b.quantity > 0 && b.quantity <= 1000, 'Cantidad: entre 1 y 1000 unidades.');
       const product = b.product_id ? await one(db, 'SELECT * FROM products WHERE id=?', b.product_id) : null;
       assert(!b.product_id || product, 'Producto no encontrado.');
-      const unitPrice = cents(b.unit_price); assert(unitPrice > 0, 'El precio debe ser mayor a cero.');
-      if (user.role === 'operator' && product) assert(unitPrice === product.price, 'Solo un administrador puede cargar un precio histórico diferente.', 403);
+      const schoolPrice=product?await one(db,'SELECT price FROM product_school_prices WHERE product_id=? AND school_id=?',product.id,client.school_id):null;
+      const effectivePrice=schoolPrice?.price??product?.price;
+      const unitPrice = b.unit_price==null&&product?effectivePrice:cents(b.unit_price); assert(unitPrice > 0, 'El precio debe ser mayor a cero.');
+      if (user.role === 'operator' && product) assert(unitPrice === effectivePrice, 'Solo un administrador puede cargar un precio histórico diferente.', 403);
       const description = product?.name || text(b.description);
       assert(description, 'Indicá el concepto.');
       assert(/^\d{4}-\d{2}-\d{2}$/.test(b.occurred_on || '') && !Number.isNaN(Date.parse(b.occurred_on)) && new Date(b.occurred_on).toISOString().slice(0,10) === b.occurred_on, 'Fecha inválida.');
@@ -189,7 +317,18 @@ async function api(request, env) {
     const productId=url.searchParams.get('product');
     const limit=50,offset=Number(url.searchParams.get('offset')||0);
     assert(Number.isSafeInteger(offset)&&offset>=0,'Página inválida.');
-    return json(await rows(db,'SELECT h.*,p.name AS product_name,u.name AS actor_name FROM price_history h JOIN products p ON p.id=h.product_id JOIN users u ON u.id=h.actor WHERE (? IS NULL OR h.product_id=?) ORDER BY h.created_at DESC,h.rowid DESC LIMIT ? OFFSET ?',productId,productId,limit,offset));
+    return json(await rows(db,`SELECT h.*,p.name AS product_name,u.name AS actor_name,s.name AS school_name FROM (SELECT id,product_id,price,actor,created_at,NULL AS school_id FROM price_history UNION ALL SELECT id,product_id,price,actor,created_at,school_id FROM school_price_history) h JOIN products p ON p.id=h.product_id JOIN users u ON u.id=h.actor LEFT JOIN schools s ON s.id=h.school_id WHERE (? IS NULL OR h.product_id=?) AND (?=1 OR h.school_id IS NULL OR h.school_id IN (SELECT value FROM json_each(?))) ORDER BY h.created_at DESC LIMIT ? OFFSET ?`,productId,productId,user.role==='superadmin'?1:0,user.school_ids,limit,offset));
+  }
+  if(path==='/api/categories'&&method==='POST'){
+    role(user,['superadmin','admin']);const b=await body(request),name=text(b.name,80);assert(name,'Ingresá el nombre de la categoría.');
+    try{await db.batch([stmt(db,'INSERT INTO categories(id,name,created_at) VALUES (?,?,?)',id(),name,now()),audit(db,user.id,'category.create',{name})]);}catch(e){if(/UNIQUE constraint/.test(e.message))assert(false,'Ya existe una categoría con ese nombre.',409);throw e;}
+    return json({ok:true},201);
+  }
+  const categoryMatch=path.match(/^\/api\/categories\/([^/]+)$/);
+  if(categoryMatch&&method==='PUT'){
+    role(user,['superadmin','admin']);const b=await body(request),name=text(b.name,80);assert(name,'Ingresá el nombre de la categoría.');
+    try{const result=await stmt(db,'UPDATE categories SET name=? WHERE id=?',name,categoryMatch[1]).run();assert(result.meta.changes,'Categoría no encontrada.',404);await db.batch([audit(db,user.id,'category.rename',{id:categoryMatch[1],name})]);}catch(e){if(/UNIQUE constraint/.test(e.message))assert(false,'Ya existe una categoría con ese nombre.',409);throw e;}
+    return json({ok:true});
   }
   if(path==='/api/products/import' && method==='POST'){
     role(user,['superadmin','admin']);const b=await body(request),key=request.headers.get('Idempotency-Key');
@@ -207,21 +346,36 @@ async function api(request, env) {
     await catalogCommit(db,user,key,requestHash,revision,[
       stmt(db,`INSERT INTO products(id,name,price,version) SELECT json_extract(value,'$.id'),json_extract(value,'$.name'),json_extract(value,'$.price'),0 FROM json_each(?) WHERE json_extract(value,'$.action')='create'`,encoded),
       stmt(db,`UPDATE products SET price=(SELECT json_extract(value,'$.price') FROM json_each(?) WHERE json_extract(value,'$.id')=products.id),version=version+1 WHERE id IN (SELECT json_extract(value,'$.id') FROM json_each(?) WHERE json_extract(value,'$.action')='update')`,encoded,encoded),
-      stmt(db,`INSERT INTO price_history SELECT ? || ':' || json_extract(value,'$.id'),json_extract(value,'$.id'),json_extract(value,'$.price'),?,? FROM json_each(?)`,key,user.id,created,encoded),
+      stmt(db,`INSERT INTO price_history(id,product_id,price,actor,created_at) SELECT ? || ':' || json_extract(value,'$.id'),json_extract(value,'$.id'),json_extract(value,'$.price'),?,? FROM json_each(?)`,key,user.id,created,encoded),
       audit(db,user.id,'products.import',{created:plan.create,updated:plan.update,skipped:plan.skip})
     ]);return json({ok:true,created:plan.create,updated:plan.update,skipped:plan.skip});
   }
   if (path === '/api/products' && method === 'POST') {
     role(user, ['superadmin','admin']); const b = await body(request), price = cents(b.price), productId = id();
     assert(text(b.name) && price > 0, 'Completá nombre y precio.');
-    await catalogCommit(db,user,id(),'create',await catalogVersion(db),[stmt(db, 'INSERT INTO products(id,name,price) VALUES (?,?,?)', productId, text(b.name), price), stmt(db, 'INSERT INTO price_history VALUES (?,?,?,?,?)', id(), productId, price, user.id, now())]);
+    const categoryId=text(b.category_id)||null;assert(!categoryId||await one(db,'SELECT id FROM categories WHERE id=?',categoryId),'Categoría no encontrada.');
+    await catalogCommit(db,user,id(),'create',await catalogVersion(db),[stmt(db, 'INSERT INTO products(id,name,price,category_id) VALUES (?,?,?,?)', productId, text(b.name), price,categoryId), stmt(db, 'INSERT INTO price_history(id,product_id,price,actor,created_at) VALUES (?,?,?,?,?)', id(), productId, price, user.id, now())]);
     return json({ ok: true });
   }
+  const schoolPriceMatch=path.match(/^\/api\/products\/([^/]+)\/school-price$/);
+  if(schoolPriceMatch&&['POST','DELETE'].includes(method)){
+    role(user,['superadmin','admin']);const productId=schoolPriceMatch[1],product=await one(db,'SELECT * FROM products WHERE id=?',productId);assert(product,'Producto no encontrado.',404);
+    const b=method==='POST'?await body(request):{},schoolId=text(b.school_id||url.searchParams.get('school_id'));assert(['school-1','school-2','school-3'].includes(schoolId),'Colegio inválido.');scope(user,schoolId);
+    const existing=await one(db,'SELECT price FROM product_school_prices WHERE product_id=? AND school_id=?',productId,schoolId);assert(method!=='DELETE'||existing,'No hay precio diferencial para restaurar.',404);
+    const price=method==='POST'?cents(b.price):product.price;assert(method!=='POST'||price>0,'El precio debe ser mayor a cero.');
+    const statements=method==='POST'?[stmt(db,'INSERT INTO product_school_prices(product_id,school_id,price,actor,updated_at) VALUES (?,?,?,?,?) ON CONFLICT(product_id,school_id) DO UPDATE SET price=excluded.price,actor=excluded.actor,updated_at=excluded.updated_at',productId,schoolId,price,user.id,now())]:[stmt(db,'DELETE FROM product_school_prices WHERE product_id=? AND school_id=?',productId,schoolId)];
+    statements.push(stmt(db,'INSERT INTO school_price_history(id,product_id,school_id,price,actor,created_at) VALUES (?,?,?,?,?,?)',id(),productId,schoolId,price,user.id,now()),audit(db,user.id,method==='POST'?'product.school_price.set':'product.school_price.reset',{product_id:productId,school_id:schoolId,price}));
+    await catalogCommit(db,user,id(),JSON.stringify({productId,schoolId,method,price}),await catalogVersion(db),statements);return json({ok:true,price,school_id:schoolId});
+  }
   if (/^\/api\/products\/[^/]+$/.test(path) && method === 'PUT') {
-    role(user, ['superadmin','admin']); const b = await body(request), price = cents(b.price), productId = path.split('/').pop();
-    assert(price > 0, 'Precio inválido.');
+    role(user, ['superadmin','admin']); const b = await body(request), price = b.price==null?null:cents(b.price), productId = path.split('/').pop();
+    assert(price===null||price>0,'Precio inválido.');
     const product = await one(db, 'SELECT * FROM products WHERE id=?', productId); assert(product, 'Producto no encontrado.', 404);
-    await catalogCommit(db,user,id(),'price',await catalogVersion(db),[stmt(db, 'UPDATE products SET price=?,version=version+1 WHERE id=?', price, productId), stmt(db, 'INSERT INTO price_history VALUES (?,?,?,?,?)', id(), productId, price, user.id, now())]);
+    const name=b.name==null?product.name:text(b.name,160),categoryId=b.category_id===undefined?product.category_id:(text(b.category_id)||null);assert(name,'Ingresá el nombre del producto.');assert(!categoryId||await one(db,'SELECT id FROM categories WHERE id=?',categoryId),'Categoría no encontrada.');
+    const statements=[stmt(db,'UPDATE products SET name=?,category_id=?,price=COALESCE(?,price),version=version+1 WHERE id=?',name,categoryId,price,productId)];
+    if(price!==null)statements.push(stmt(db,'INSERT INTO price_history(id,product_id,price,actor,created_at) VALUES (?,?,?,?,?)',id(),productId,price,user.id,now()));
+    statements.push(audit(db,user.id,'product.update',{id:productId,name,category_id:categoryId,price}));
+    await catalogCommit(db,user,id(),'update',await catalogVersion(db),statements);
     return json({ ok: true });
   }
   if (path === '/api/settings' && method === 'PUT') {

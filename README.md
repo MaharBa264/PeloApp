@@ -1,6 +1,6 @@
 # PeloApp
 
-Cuentas corrientes para tres kioscos escolares. Interfaz luminosa adaptable a celular y PC. Primera versión **0.2.0 de piloto**, con comparación de precios al adquirir y al pagar, anticipos y permisos por colegio.
+Cuentas corrientes para tres kioscos escolares. Interfaz luminosa adaptable a celular y PC. Versión **0.3.0 de piloto**, con comparación de precios al adquirir y al pagar, anticipos, permisos por colegio e ingreso de documentos desde fotos como borradores revisables.
 
 ## Estado
 
@@ -8,6 +8,7 @@ Código y configuración preparados para Cloudflare Workers + D1. La conexión d
 
 - [Configurar Cloudflare y crear el primer superadministrador](docs/CLOUDFLARE.md)
 - [Alcance implementado, reglas monetarias y pendientes](docs/ALCANCE.md)
+- [Configurar Cloudflare R2 y probar carga de documentos](docs/CLOUDFLARE.md#almacenamiento-de-fotos-de-documentos)
 
 ## Desarrollo
 

@@ -6,11 +6,14 @@
   "assets": { "directory": "./public", "binding": "ASSETS", "run_worker_first": true },
   "vars": { "APP_ENV": "production" },
   "d1_databases": [{ "binding": "DB", "database_name": "PeloApp-prod", "database_id": "a2aacc00-64ad-43c4-b6d1-607d49cabb6b", "migrations_dir": "migrations" }],
+  "r2_buckets": [{ "binding": "DOCUMENTS", "bucket_name": "peloapp-documents-prod" }],
+  "ai": { "binding": "AI" },
   "env": {
     "dev": {
       "name": "peloapp-dev",
       "vars": { "APP_ENV": "development" },
-      "d1_databases": [{ "binding": "DB", "database_name": "PeloApp-dev", "database_id": "61010828-6e12-430a-b00a-d01fc0c4c2bc", "migrations_dir": "migrations" }]
+      "d1_databases": [{ "binding": "DB", "database_name": "PeloApp-dev", "database_id": "61010828-6e12-430a-b00a-d01fc0c4c2bc", "migrations_dir": "migrations" }],
+      "r2_buckets": [{ "binding": "DOCUMENTS", "bucket_name": "peloapp-documents-dev" }]
     }
   }
 }

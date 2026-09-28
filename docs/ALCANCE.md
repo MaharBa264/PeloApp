@@ -35,7 +35,8 @@ Al confirmar un cobro se emplea el precio revisado por el servidor; si la cuenta
 - Exportaciones estructuradas, respaldos externos en Drive y reportes Sheets. No están conectados todavía.
 - Stock por recuentos libres; salidas estimadas conciliadas con consumos registrados, mermas y transferencias.
 - Depósito central, compras distribuidas y equivalencias caja/unidad.
-- Lectura de fotos/PDF con revisión y prevención de doble recepción remito/factura.
+- Compras, recepción y pago a proveedores; registro de movimientos de stock por colegio y prevención de doble recepción al vincular remitos/facturas.
+- Lectura de archivos PDF; hoy se admiten fotos JPG, PNG y WebP.
 - Apps Android/Windows/Linux y sincronización offline. Actualmente se requiere conexión; la pantalla mantiene los formularios al fallar una solicitud, pero recargar/cerrar pierde el borrador.
 - Precios por colegio y personalización ampliada de comprobantes.
 
@@ -53,3 +54,20 @@ Probar con datos ficticios en dev. El SQL y las pruebas de integración locales 
 - Importación .xlsx: selección de hoja y columnas, primera fila como encabezado, vista previa, nombres repetidos y precios inválidos identificados. Hasta 300 filas y 3 MB por archivo.
 - Coincidencias de productos por nombre normalizado. Se omiten por defecto; actualizar sus precios requiere marcar la opción. Productos nuevos y cambios se guardan atómicamente, generan historial y no se duplican al reintentar. No se importan stocks ni costos en este incremento.
 - La migración 0002 conserva todos los usuarios, productos, consumos y pagos existentes.
+
+## Ampliación 0.3.0 · Borradores desde fotos
+
+- Superadministrador y administradores pueden cargar fotos JPG, PNG o WebP de hasta 3 MB desde celular o PC.
+- Cloudflare Workers AI propone tipo, proveedor, número, fecha, total, observaciones y renglones del documento. La propuesta queda marcada para revisión; si el modelo no está disponible, se puede completar manualmente.
+- El original se almacena en un bucket R2 privado. La app expone la imagen solo a usuarios autorizados.
+- Los datos se pueden corregir, agregar/quitar renglones, y vincular documentos relacionados (por ejemplo, remito y factura). Se puede eliminar el borrador junto con su imagen.
+- Esta etapa es una bandeja de revisión: guardar un borrador **no contabiliza compras, no cambia precios de venta ni mueve stock**. Esos movimientos requieren definir el circuito de compras y reparto entre colegios.
+- La imagen se procesa con Cloudflare Workers AI para extraer datos. Evitar subir información que no corresponda a la gestión de estos kioscos.
+
+## Ampliación 0.4.0 · Catálogo y cuentas por colegio
+
+- Categorías compartidas, asignables a productos, renombrables y filtrables; búsqueda por producto o categoría.
+- Carga rápida de consumo desde Cuentas corrientes y desde cada cliente, con búsqueda de cuenta y producto.
+- Catálogo general compartido con precios diferenciales por colegio. Cada consumo conserva el precio aplicado; la deuda pendiente se compara contra el precio vigente de su colegio.
+- Un cliente puede tener cuenta en varios colegios: se comparte su ficha, pero cada colegio conserva una cuenta, saldo, consumos, pagos y criterio de cobro independientes.
+- La migración 0004 agrega los vínculos y precios sin reescribir consumos, pagos ni el historial general existente.

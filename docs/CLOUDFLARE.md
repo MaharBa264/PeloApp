@@ -9,6 +9,19 @@
 
 Los IDs no son credenciales. El binding de la aplicación se llama `DB`. Ambas bases pertenecen a la cuenta Cloudflare del propietario; este repositorio no demuestra que ya se hayan aplicado migraciones ni publicado Workers.
 
+## Almacenamiento de fotos de documentos
+
+Antes del siguiente despliegue, crear dos buckets desde Cloudflare → R2 Object Storage → **Create bucket**:
+
+- `peloapp-documents-dev`
+- `peloapp-documents-prod`
+
+Dejarlos privados: no habilitar acceso público ni dominio personalizado. `wrangler.jsonc` los enlaza al Worker correspondiente. El Worker verifica sesión y rol antes de guardar o mostrar una imagen. La binding de Workers AI `AI` no usa un token; el código invoca `@cf/moondream/moondream3.1-9B-A2B` para leer una propuesta desde la foto.
+
+Estado al 28/09/2026: el propietario confirmó que ambos buckets ya fueron creados. La rama `dev` se usa para completar y probar el despliegue antes de publicar cambios en producción.
+
+Workers AI tiene una cuota gratuita diaria; al agotarse, la app igual guarda el documento como borrador manual para que se complete sin OCR. Revisar la cuota y las condiciones vigentes en Cloudflare antes de cargar documentos reales.
+
 ## Primero: entorno de pruebas
 
 Cloudflare → Workers & Pages → Create application → Import a repository → MaharBa264/PeloApp.
@@ -22,7 +35,9 @@ Cloudflare → Workers & Pages → Create application → Import a repository �
 
 Cloudflare debe instalar dependencias con `npm ci` (usa el package-lock del repositorio). Los comandos de build y deploy no cambian en esta actualización.
 
-El comando verifica el proyecto, aplica migraciones **a PeloApp-dev** y despliega `--env dev`. No agrega credenciales al repositorio. La identidad de build de Cloudflare necesita permisos de edición de Workers y D1 para aplicar migraciones; si la migración devuelve autorización denegada, revisar el token de build del proyecto en Cloudflare. No pegar tokens en issues o archivos.
+El comando verifica el proyecto, aplica migraciones **a PeloApp-dev** y despliega `--env dev`. No agrega credenciales al repositorio.
+
+Configuración verificada en Cloudflare el 28/09/2026: repositorio `MaharBa264/PeloApp`, rama `dev`, raíz `/`, build `npm run check` y deploy `npm run deploy:dev`. Una vez conectada la integración, Cloudflare solo procesa pushes nuevos; para iniciar el primer build posterior a la conexión, hace falta un commit nuevo en `dev`. La identidad de build de Cloudflare necesita permisos de edición de Workers y D1 para aplicar migraciones; si la migración devuelve autorización denegada, revisar el token de build del proyecto en Cloudflare. No pegar tokens en issues o archivos.
 
 ## Crear el superadministrador
 
@@ -59,6 +74,7 @@ Cada push a main ejecuta los controles antes de migrar y publicar. Si los contro
 4. Crear producto y cliente de prueba, cargar consumo, aumentar precio y cobrar parcialmente.
 5. Probar usuario de otro colegio: no debe acceder a la cuenta.
 6. Hacer un commit inocuo en la rama correspondiente y comprobar en Builds la publicación automática.
+7. En `dev`, probar una foto de factura, corregir un renglón, guardar y volver a abrirla. Verificar que se ve el original, que el documento sigue como borrador y que ningún precio de venta o saldo cambió.
 
 ## Actualizaciones y respaldo
 
