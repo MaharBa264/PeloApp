@@ -42,7 +42,8 @@ async function detail(db, client, offset=0) {
   assert(Number.isSafeInteger(offset)&&offset>=0,'Página inválida.');
   const lines = await pending(db, client.id);
   const events = await rows(db, 'SELECT e.*,u.name AS actor_name,(v.target_event_id IS NOT NULL) AS voided,ve.kind AS void_kind FROM events e JOIN users u ON u.id=e.actor LEFT JOIN event_voids v ON v.target_event_id=e.id LEFT JOIN events ve ON ve.id=v.void_event_id WHERE e.client_id=? ORDER BY e.version DESC LIMIT 50 OFFSET ?', client.id,offset);
-  return { client, offset, lines: lines.map(l => ({ ...l, current_value: valueOf(l, 'current') })), events: events.map(e => ({ ...e, voided: Boolean(e.voided), data: JSON.parse(e.data) })) };
+  const paymentRequests = await rows(db, "SELECT id,amount,status,checkout_url,note,created_at FROM payment_requests WHERE client_id=? AND status IN ('pending','review') ORDER BY created_at DESC", client.id);
+  return { client, offset, payment_requests: paymentRequests, lines: lines.map(l => ({ ...l, current_value: valueOf(l, 'current') })), events: events.map(e => ({ ...e, voided: Boolean(e.voided), data: JSON.parse(e.data) })) };
 }
 async function commitAccount(db, client, user, key, kind, data, requestHash, statements) {
   assert(/^[a-zA-Z0-9-]{16,80}$/.test(key || ''), 'Falta el identificador de operación.');
@@ -179,21 +180,146 @@ async function supplierEvolution(db, supplier, from, to) {
   const average = compared.length ? Math.round(compared.reduce((a, i) => a + i.change_pct, 0) / compared.length * 100) / 100 : null;
   return { supplier: { id: supplier.id, name: supplier.name }, from: from || first || null, to, summary: { products: items.length, compared: compared.length, with_change: items.filter(i => i.changes > 0).length, average_change_pct: average }, items, changes, series };
 }
+const randomToken = () => btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(32)))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+const pesos = c => `$${(c / 100).toLocaleString('es-AR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+const csvCell = v => { let t = String(v ?? ''); if (/^[=+\-@\t\r]/.test(t)) t = `'${t}`; return /[;"\n\r]/.test(t) ? `"${t.replace(/"/g, '""')}"` : t; };
+const csvMoney = c => (c / 100).toFixed(2).replace('.', ',');
+const mpEnabled = env => Boolean(env.MP_ACCESS_TOKEN && env.MP_WEBHOOK_SECRET);
+const mpBase = env => String(env.MP_API_BASE || 'https://api.mercadopago.com').replace(/\/$/, '');
+async function hmacHex(secret, message) {
+  const key = await crypto.subtle.importKey('raw', bytes(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  return hex(await crypto.subtle.sign('HMAC', key, bytes(message)));
+}
+async function currentDue(db, client) {
+  return (await pending(db, client.id)).reduce((sum, line) => sum + valueOf(line, client.mode), 0);
+}
+// Devuelve true si el movimiento supera el límite y fue confirmado; lanza 409 si supera y no se confirmó.
+async function checkDebtLimit(db, client, extra, confirmed) {
+  if (!client.debt_limit || extra <= 0) return false;
+  const after = await currentDue(db, client) + extra;
+  if (after <= client.debt_limit) return false;
+  if (confirmed === true) return true;
+  throw Object.assign(new Error(`Con este movimiento la deuda sería ${pesos(after)} y supera el límite de ${pesos(client.debt_limit)}.`), { status: 409, code: 'over_limit' });
+}
+async function publicStatementData(db, token) {
+  const link = await one(db, 'SELECT * FROM statement_links WHERE token_hash=? AND revoked_at IS NULL AND expires_at>?', await hash(token), Date.now());
+  assert(link, 'Este enlace no es válido o venció. Pedí uno nuevo.', 404);
+  const client = await one(db, 'SELECT c.*,s.name AS school_name,s.logo AS school_logo,s.color AS school_color FROM clients c JOIN schools s ON s.id=c.school_id WHERE c.id=?', link.client_id);
+  const lines = (await pending(db, client.id)).map(l => ({ ...l, current_value: valueOf(l, 'current') }));
+  const payments = await rows(db, "SELECT e.created_at,e.data FROM events e WHERE e.client_id=? AND e.kind='payment' AND NOT EXISTS (SELECT 1 FROM event_voids v WHERE v.target_event_id=e.id) ORDER BY e.version DESC LIMIT 10", client.id);
+  const settings = JSON.parse((await one(db, 'SELECT data FROM settings WHERE id=1')).data);
+  const originalDue = lines.reduce((sum, l) => sum + l.remaining, 0), currentDueValue = lines.reduce((sum, l) => sum + l.current_value, 0);
+  return {
+    business: { name: settings.name, footer: settings.footer, logo: settings.logo },
+    school: { name: client.school_name, logo: client.school_logo, color: client.school_color },
+    client: { name: client.name }, mode: client.mode, as_of: now(), expires_at: link.expires_at,
+    due: client.mode === 'current' ? currentDueValue : originalDue, original_due: originalDue, credit: client.credit,
+    lines: lines.map(l => ({ description: l.description, quantity: l.quantity, occurred_on: l.occurred_on, unit_price: client.mode === 'current' && l.current_price ? l.current_price : l.unit_price, remaining: l.remaining, current_value: l.current_value, partial: l.remaining < l.quantity * l.unit_price })),
+    payments: payments.map(x => ({ date: x.created_at, amount: JSON.parse(x.data).received }))
+  };
+}
+async function debtorsReport(db, user, school, minCents) {
+  const today = localDate(Date.now()), buckets = () => ({ d0_30: 0, d31_60: 0, d61_90: 0, d90: 0 });
+  const lines = await rows(db, `SELECT c.id AS client_id,c.name,c.kind,c.contact,c.school_id,s.name AS school_name,c.mode,c.credit,c.debt_limit,h.id,h.product_id,h.remaining,h.unit_price,h.occurred_on,COALESCE(sp.price,p.price) AS current_price
+    FROM charges h JOIN clients c ON c.id=h.client_id JOIN schools s ON s.id=c.school_id LEFT JOIN products p ON p.id=h.product_id LEFT JOIN product_school_prices sp ON sp.product_id=h.product_id AND sp.school_id=c.school_id
+    WHERE h.remaining>0 AND (?=1 OR c.school_id IN (SELECT value FROM json_each(?))) AND (?='' OR c.school_id=?) ORDER BY h.occurred_on`, user.role === 'superadmin' ? 1 : 0, user.school_ids, school, school);
+  const byClient = new Map();
+  for (const l of lines) {
+    let row = byClient.get(l.client_id);
+    if (!row) byClient.set(l.client_id, row = { client_id: l.client_id, name: l.name, kind: l.kind, contact: l.contact, school_id: l.school_id, school_name: l.school_name, mode: l.mode, credit: l.credit, debt_limit: l.debt_limit, due: 0, original_due: 0, oldest_date: l.occurred_on, oldest_days: 0, items: 0, buckets: buckets() });
+    const value = valueOf(l, l.mode), days = Math.max(0, Math.floor((Date.parse(`${today}T00:00:00Z`) - Date.parse(`${l.occurred_on}T00:00:00Z`)) / 86400000));
+    row.due += value; row.original_due += l.remaining; row.items++;
+    row.buckets[days <= 30 ? 'd0_30' : days <= 60 ? 'd31_60' : days <= 90 ? 'd61_90' : 'd90'] += value;
+    row.oldest_days = Math.max(row.oldest_days, days);
+  }
+  const list = [...byClient.values()].filter(r => r.due >= minCents).map(r => ({ ...r, over_limit: Boolean(r.debt_limit && r.due > r.debt_limit) })).sort((a, b) => b.due - a.due || a.name.localeCompare(b.name));
+  const totals = { clients: list.length, due: 0, original_due: 0, credit: 0, over_limit: list.filter(r => r.over_limit).length, buckets: buckets() };
+  list.forEach(r => { totals.due += r.due; totals.original_due += r.original_due; totals.credit += r.credit; Object.keys(totals.buckets).forEach(k => totals.buckets[k] += r.buckets[k]); });
+  return { as_of: today, rows: list, totals };
+}
+function debtorsCsv(report, schools) {
+  const header = ['Cliente', 'Tipo', 'Colegio', 'Contacto', 'Deuda', 'Deuda a precio original', 'Saldo a favor', 'Límite de deuda', 'Supera límite', 'Antigüedad máxima (días)', '0-30 días', '31-60 días', '61-90 días', 'Más de 90 días'];
+  const body = report.rows.map(r => [r.name, r.kind, r.school_name, r.contact, csvMoney(r.due), csvMoney(r.original_due), csvMoney(r.credit), r.debt_limit ? csvMoney(r.debt_limit) : '', r.over_limit ? 'Sí' : 'No', r.oldest_days, csvMoney(r.buckets.d0_30), csvMoney(r.buckets.d31_60), csvMoney(r.buckets.d61_90), csvMoney(r.buckets.d90)]);
+  void schools;
+  return '﻿' + [header, ...body].map(line => line.map(csvCell).join(';')).join('\r\n') + '\r\n';
+}
+async function createMpPreference(env, origin, requestId, client, amount) {
+  const response = await fetch(`${mpBase(env)}/checkout/preferences`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${env.MP_ACCESS_TOKEN}`, 'Content-Type': 'application/json', 'X-Idempotency-Key': requestId },
+    body: JSON.stringify({
+      items: [{ id: requestId, title: `Pago de cuenta · ${client.name}`.slice(0, 120), quantity: 1, currency_id: 'ARS', unit_price: amount / 100 }],
+      external_reference: requestId, notification_url: `${origin}/api/webhooks/mercadopago`,
+      back_urls: { success: origin, failure: origin, pending: origin }
+    })
+  });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok || !result.id || !result.init_point) { console.error('mp_preference_failed', response.status); assert(false, 'Mercado Pago no aceptó la solicitud. Revisá la configuración del acceso.', 502); }
+  return result;
+}
+async function verifyMpSignature(request, env, dataId) {
+  const parts = Object.fromEntries((request.headers.get('x-signature') || '').split(',').map(part => { const i = part.indexOf('='); return [part.slice(0, i).trim(), part.slice(i + 1).trim()]; }));
+  if (!parts.ts || !parts.v1) return false;
+  const id = /^[a-z0-9]+$/i.test(dataId) ? dataId.toLowerCase() : dataId;
+  const expected = await hmacHex(env.MP_WEBHOOK_SECRET, `id:${id};request-id:${request.headers.get('x-request-id') || ''};ts:${parts.ts};`);
+  return safeEqual(expected, parts.v1.toLowerCase());
+}
+async function reconcileMercadoPago(db, paymentRequest, paymentId, amount) {
+  const key = `mercadopago-payment-${paymentId}`;
+  for (let attempt = 0; ; attempt++) {
+    const client = await one(db, 'SELECT * FROM clients WHERE id=?', paymentRequest.client_id);
+    const quote = settlement(await pending(db, client.id), amount, 0, client.mode);
+    const data = { ...quote, credit: client.credit + quote.credit, previous_credit: client.credit, method: 'Mercado Pago', note: `Mercado Pago #${paymentId}`, payment_request_id: paymentRequest.id, provider_ref: String(paymentId) };
+    const encoded = JSON.stringify(quote.allocations), paidAt = now();
+    try {
+      await commitAccount(db, client, { id: 'system-mercadopago' }, key, 'payment', data, await hash(String(paymentId)), [
+        stmt(db, `UPDATE charges SET remaining=(SELECT json_extract(value,'$.remaining') FROM json_each(?) WHERE json_extract(value,'$.id')=charges.id) WHERE client_id=? AND id IN (SELECT json_extract(value,'$.id') FROM json_each(?))`, encoded, client.id, encoded),
+        stmt(db, 'UPDATE clients SET credit=? WHERE id=?', data.credit, client.id),
+        stmt(db, "UPDATE payment_requests SET status='paid',paid_at=?,event_id=?,provider_ref=? WHERE id=?", paidAt, key, String(paymentId), paymentRequest.id),
+        audit(db, 'system-mercadopago', 'payment_request.paid', { id: paymentRequest.id, client_id: client.id, amount, provider_ref: String(paymentId) })
+      ]);
+      return;
+    } catch (error) { if (error.status === 409 && attempt < 2) continue; throw error; }
+  }
+}
+async function mercadoPagoWebhook(request, env, db, url) {
+  assert(mpEnabled(env), 'Mercado Pago no está configurado.', 503);
+  const raw = await request.text();
+  let payload = {}; try { payload = raw ? JSON.parse(raw) : {}; } catch { /* la firma se valida con el id de la URL */ }
+  const dataId = String(url.searchParams.get('data.id') || payload?.data?.id || ''), type = url.searchParams.get('type') || url.searchParams.get('topic') || payload?.type || '';
+  assert(await verifyMpSignature(request, env, dataId), 'Firma inválida.', 401);
+  if (type !== 'payment' || !/^[A-Za-z0-9]{1,40}$/.test(dataId)) return json({ ok: true, ignored: true });
+  const response = await fetch(`${mpBase(env)}/v1/payments/${dataId}`, { headers: { Authorization: `Bearer ${env.MP_ACCESS_TOKEN}` } });
+  assert(response.ok, 'No se pudo confirmar el pago con Mercado Pago.', 502);
+  const payment = await response.json();
+  const paymentRequest = await one(db, 'SELECT * FROM payment_requests WHERE id=?', String(payment.external_reference || ''));
+  if (!paymentRequest || payment.status !== 'approved') return json({ ok: true, ignored: true });
+  if (paymentRequest.status === 'paid') {
+    if (paymentRequest.provider_ref !== String(payment.id)) await db.batch([audit(db, 'system-mercadopago', 'payment_request.duplicate_payment', { id: paymentRequest.id, provider_ref: String(payment.id) })]);
+    return json({ ok: true, repeated: true });
+  }
+  const amount = Math.round(Number(payment.transaction_amount) * 100);
+  const review = reason => db.batch([stmt(db, "UPDATE payment_requests SET status='review' WHERE id=? AND status<>'paid'", paymentRequest.id), audit(db, 'system-mercadopago', 'payment_request.review', { id: paymentRequest.id, reason, provider_ref: String(payment.id), amount })]);
+  if (payment.currency_id !== 'ARS' || amount !== paymentRequest.amount) { await review('amount_mismatch'); return json({ ok: true, review: true }); }
+  try { await reconcileMercadoPago(db, paymentRequest, payment.id, amount); }
+  catch (error) { if (error.status !== 400) throw error; await review('cannot_apply'); return json({ ok: true, review: true }); }
+  return json({ ok: true });
+}
 async function api(request, env) {
   const db = env.DB, url = new URL(request.url), path = url.pathname, method = request.method;
   assert(db, 'Falta vincular la base D1.', 503);
-  if (!['GET','HEAD'].includes(method)) {
+  if (!['GET','HEAD'].includes(method) && path !== '/api/webhooks/mercadopago') {
     assert(request.headers.get('Origin') === url.origin, 'Origen no permitido.', 403);
   }
   if (path === '/api/status' && method === 'GET') {
-    const existing = await one(db, 'SELECT id FROM users LIMIT 1');
+    const existing = await one(db, "SELECT id FROM users WHERE id NOT LIKE 'system-%' LIMIT 1");
     return json({ initialized: Boolean(existing), environment: env.APP_ENV });
   }
   if (path === '/api/setup' && method === 'POST') {
     await rateLimit(db, request);
     const b = await body(request);
     assert(env.BOOTSTRAP_TOKEN && safeEqual(String(b.token || ''), env.BOOTSTRAP_TOKEN), 'Clave de instalación incorrecta.', 403);
-    assert(!await one(db, 'SELECT id FROM users LIMIT 1'), 'La instalación ya se completó.', 409);
+    assert(!await one(db, "SELECT id FROM users WHERE id NOT LIKE 'system-%' LIMIT 1"), 'La instalación ya se completó.', 409);
     assert(text(b.name) && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(text(b.email)), 'Completá nombre y correo.');
     assert(typeof b.password === 'string' && b.password.length >= 12 && b.password.length <= 128, 'Usá una contraseña de 12 a 128 caracteres.');
     await db.batch([
@@ -213,10 +339,72 @@ async function api(request, env) {
     await db.batch([stmt(db, 'INSERT INTO sessions VALUES (?,?,?)', await hash(token), user.id, Date.now() + 12 * 3600000), stmt(db, 'DELETE FROM sessions WHERE expires_at<?', Date.now())]);
     return json({ user: publicUser(user) }, 200, { 'Set-Cookie': `pelo_session=${token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=43200` });
   }
+  const publicStatement = path.match(/^\/api\/public\/statement\/([A-Za-z0-9_-]{20,200})$/);
+  if (publicStatement && method === 'GET') return json(await publicStatementData(db, publicStatement[1]));
+  if (path === '/api/webhooks/mercadopago' && method === 'POST') return mercadoPagoWebhook(request, env, db, url);
+  if (path === '/api/reset' && method === 'POST') {
+    await rateLimit(db, request);
+    const b = await body(request);
+    assert(typeof b.password === 'string' && b.password.length >= 12 && b.password.length <= 128, 'Usá una contraseña de 12 a 128 caracteres.');
+    const reset = await one(db, 'SELECT r.*,u.active FROM password_resets r JOIN users u ON u.id=r.user_id WHERE r.token_hash=? AND r.used_at IS NULL AND r.expires_at>?', await hash(String(b.token || '')), Date.now());
+    assert(reset && reset.active, 'El enlace no es válido o venció. Pedile uno nuevo a un administrador.', 400);
+    await db.batch([
+      stmt(db, 'UPDATE users SET password=? WHERE id=?', await passwordHash(b.password), reset.user_id),
+      stmt(db, 'UPDATE password_resets SET used_at=? WHERE token_hash=?', Date.now(), reset.token_hash),
+      stmt(db, 'DELETE FROM sessions WHERE user_id=?', reset.user_id),
+      audit(db, reset.user_id, 'user.password_reset', {})
+    ]);
+    return json({ ok: true });
+  }
   const token = (request.headers.get('Cookie') || '').match(/(?:^|;\s*)pelo_session=([^;]+)/)?.[1] || '';
   const user = await one(db, 'SELECT u.* FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token=? AND s.expires_at>? AND u.active=1', await hash(token), Date.now());
   assert(user, 'Iniciá sesión para continuar.', 401);
   const validSchools = new Set((await rows(db, 'SELECT id FROM schools')).map(x => x.id));
+  if (path === '/api/password' && method === 'POST') {
+    await rateLimit(db, request);
+    const b = await body(request);
+    assert(typeof b.current === 'string' && b.current.length <= 128, 'Ingresá tu contraseña actual.');
+    assert(typeof b.password === 'string' && b.password.length >= 12 && b.password.length <= 128, 'Usá una contraseña de 12 a 128 caracteres.');
+    assert(safeEqual(await passwordHash(b.current, user.password.split(':')[0]), user.password), 'La contraseña actual no es correcta.', 403);
+    assert(b.password !== b.current, 'La nueva contraseña debe ser distinta de la actual.');
+    await db.batch([
+      stmt(db, 'UPDATE users SET password=? WHERE id=?', await passwordHash(b.password), user.id),
+      stmt(db, 'DELETE FROM sessions WHERE user_id=? AND token<>?', user.id, await hash(token)),
+      audit(db, user.id, 'user.password_change', {})
+    ]);
+    return json({ ok: true });
+  }
+  const resetLinkMatch = path.match(/^\/api\/users\/([^/]+)\/reset-link$/);
+  if (resetLinkMatch && method === 'POST') {
+    role(user, ['superadmin', 'admin']);
+    const target = await one(db, "SELECT * FROM users WHERE id=? AND id NOT LIKE 'system-%'", resetLinkMatch[1]); assert(target, 'Usuario no encontrado.', 404); manageUser(user, target);
+    assert(target.role !== 'superadmin' || user.role === 'superadmin', 'Solo un superadministrador puede recuperar ese acceso.', 403);
+    const resetToken = randomToken(), expires = Date.now() + 3600000;
+    await db.batch([
+      stmt(db, 'DELETE FROM password_resets WHERE user_id=? AND used_at IS NULL', target.id),
+      stmt(db, 'INSERT INTO password_resets(token_hash,user_id,created_by,expires_at) VALUES (?,?,?,?)', await hash(resetToken), target.id, user.id, expires),
+      audit(db, user.id, 'user.reset_link', { id: target.id })
+    ]);
+    return json({ token: resetToken, expires_at: expires }, 201);
+  }
+  if (path === '/api/reports/debtors' && method === 'GET') {
+    const schoolFilter = url.searchParams.get('school') || '';
+    assert(!schoolFilter || validSchools.has(schoolFilter), 'Colegio inválido.');
+    if (schoolFilter) scope(user, schoolFilter);
+    const min = url.searchParams.get('min') ? cents(url.searchParams.get('min')) : 0;
+    const report = await debtorsReport(db, user, schoolFilter, min);
+    if (url.searchParams.get('format') === 'csv') return new Response(debtorsCsv(report), { headers: { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': `attachment; filename="deudores-${report.as_of}.csv"` } });
+    return json(report);
+  }
+  const requestCancelMatch = path.match(/^\/api\/payment-requests\/([^/]+)\/cancel$/);
+  if (requestCancelMatch && method === 'POST') {
+    role(user, ['superadmin', 'admin', 'operator']);
+    const paymentRequest = await one(db, 'SELECT * FROM payment_requests WHERE id=?', requestCancelMatch[1]); assert(paymentRequest, 'Solicitud no encontrada.', 404);
+    await account(db, user, paymentRequest.client_id);
+    assert(['pending', 'review'].includes(paymentRequest.status), 'Esa solicitud ya no se puede cancelar.', 409);
+    await db.batch([stmt(db, "UPDATE payment_requests SET status='cancelled' WHERE id=? AND status IN ('pending','review')", paymentRequest.id), audit(db, user.id, 'payment_request.cancel', { id: paymentRequest.id })]);
+    return json({ ok: true });
+  }
   if (path === '/api/documents' || path.startsWith('/api/documents/')) {
     role(user, ['superadmin','admin']);
     assert(env.DOCUMENTS, 'Falta configurar el almacenamiento privado de documentos en Cloudflare R2.', 503);
@@ -292,7 +480,7 @@ async function api(request, env) {
     const suppliers = await rows(db,'SELECT s.*,(SELECT COUNT(*) FROM products p WHERE p.supplier_id=s.id) AS product_count FROM suppliers s ORDER BY s.name');
     const products = await rows(db,'SELECT p.*,c.name AS category_name,sp.name AS supplier_name FROM products p LEFT JOIN categories c ON c.id=p.category_id LEFT JOIN suppliers sp ON sp.id=p.supplier_id ORDER BY p.name');
     const schoolPrices = await rows(db,`SELECT product_id,school_id,price FROM product_school_prices WHERE (?='superadmin' OR school_id IN (SELECT value FROM json_each(?)))`,user.role,user.school_ids);
-    return json({ user: publicUser(user), environment: env.APP_ENV, schools: schools.filter(s => user.role === 'superadmin' || JSON.parse(user.school_ids).includes(s.id)), clients, products, categories, suppliers, school_prices: schoolPrices, settings: JSON.parse((await one(db, 'SELECT data FROM settings WHERE id=1')).data) });
+    return json({ user: publicUser(user), environment: env.APP_ENV, features: { mercadopago: mpEnabled(env) }, schools: schools.filter(s => user.role === 'superadmin' || JSON.parse(user.school_ids).includes(s.id)), clients, products, categories, suppliers, school_prices: schoolPrices, settings: JSON.parse((await one(db, 'SELECT data FROM settings WHERE id=1')).data) });
   }
   if (path === '/api/clients' && method === 'POST') {
     role(user, ['superadmin','admin','operator']); const b = await body(request);
@@ -305,7 +493,7 @@ async function api(request, env) {
     await db.batch([...schoolIds.map((s,i)=>stmt(db,'INSERT INTO clients(id,name,kind,contact,school_id,mode,created_at,profile_id) VALUES (?,?,?,?,?,?,?,?)',accountIds[i],text(b.name),b.kind,text(b.contact),s,b.mode,created,profileId)),audit(db,user.id,'client.create',{profile_id:profileId,name:text(b.name),schools:schoolIds,mode:b.mode})]);
     return json({ id: accountIds[0], profile_id:profileId, accounts:accountIds.map((id,i)=>({id,school_id:schoolIds[i]})) }, 201);
   }
-  const match = path.match(/^\/api\/clients\/([^/]+)(?:\/(charge|quote|payment|schools|void|amend))?$/);
+  const match = path.match(/^\/api\/clients\/([^/]+)(?:\/(charge|quote|payment|schools|void|amend|statement-link|payment-request))?$/);
   if (match) {
     const client = await account(db, user, match[1]);
     if (!match[2] && method === 'GET') return json(await detail(db, client,Number(url.searchParams.get('offset')||0)));
@@ -314,9 +502,10 @@ async function api(request, env) {
       assert(text(b.name) && ['Familia','Alumno','Personal','Otro'].includes(b.kind),'Nombre o tipo inválido.');
       assert(['original','current'].includes(b.mode),'Criterio de cobro inválido.');
       assert(b.version===client.version,'La cuenta cambió. Volvé a abrir la edición.',409);
-      const data={before:{name:client.name,kind:client.kind,contact:client.contact,notes:client.notes,mode:client.mode},after:{name:text(b.name),kind:b.kind,contact:text(b.contact),notes:text(b.notes,1000),mode:b.mode}};
+      const debtLimit=b.debt_limit===undefined||b.debt_limit===null||b.debt_limit===''?null:cents(b.debt_limit);assert(debtLimit===null||debtLimit>0,'El límite debe ser mayor a cero.');
+      const data={before:{name:client.name,kind:client.kind,contact:client.contact,notes:client.notes,mode:client.mode,debt_limit:client.debt_limit},after:{name:text(b.name),kind:b.kind,contact:text(b.contact),notes:text(b.notes,1000),mode:b.mode,debt_limit:debtLimit}};
       const key=request.headers.get('Idempotency-Key'),requestHash=await hash(JSON.stringify(b));
-      await commitAccount(db,client,user,key,'profile',data,requestHash,[stmt(db,'UPDATE clients SET name=?,kind=?,contact=?,notes=?,version=version+1 WHERE profile_id=? AND id<>? AND (?=1 OR school_id IN (SELECT value FROM json_each(?)))',data.after.name,data.after.kind,data.after.contact,data.after.notes,client.profile_id||client.id,client.id,user.role==='superadmin'?1:0,user.school_ids),stmt(db,'UPDATE clients SET name=?,kind=?,contact=?,notes=?,mode=? WHERE id=?',data.after.name,data.after.kind,data.after.contact,data.after.notes,data.after.mode,client.id)]);
+      await commitAccount(db,client,user,key,'profile',data,requestHash,[stmt(db,'UPDATE clients SET name=?,kind=?,contact=?,notes=?,version=version+1 WHERE profile_id=? AND id<>? AND (?=1 OR school_id IN (SELECT value FROM json_each(?)))',data.after.name,data.after.kind,data.after.contact,data.after.notes,client.profile_id||client.id,client.id,user.role==='superadmin'?1:0,user.school_ids),stmt(db,'UPDATE clients SET name=?,kind=?,contact=?,notes=?,mode=?,debt_limit=? WHERE id=?',data.after.name,data.after.kind,data.after.contact,data.after.notes,data.after.mode,data.after.debt_limit,client.id)]);
       return json({ok:true});
     }
     if(match[2]==='schools'&&method==='POST'){
@@ -328,6 +517,26 @@ async function api(request, env) {
       const newAccounts=schoolIds.map(s=>({id:id(),school_id:s})),created=now();
       await db.batch([...newAccounts.map(a=>stmt(db,'INSERT INTO clients(id,name,kind,contact,school_id,mode,credit,version,created_at,notes,profile_id) VALUES (?,?,?,?,?,?,0,0,?,?,?)',a.id,client.name,client.kind,client.contact,a.school_id,client.mode,created,client.notes||'',profileId)),audit(db,user.id,'client.school_account.create',{profile_id:profileId,schools:schoolIds,accounts:newAccounts.map(a=>a.id)})]);
       return json({ok:true,accounts:newAccounts},201);
+    }
+    if (match[2] === 'statement-link' && ['POST','DELETE'].includes(method)) {
+      role(user, ['superadmin','admin','operator']);
+      if (method === 'DELETE') {
+        await db.batch([stmt(db, 'UPDATE statement_links SET revoked_at=? WHERE client_id=? AND revoked_at IS NULL', now(), client.id), audit(db, user.id, 'statement_link.revoke', { client_id: client.id })]);
+        return json({ ok: true });
+      }
+      const b = await body(request), days = b.days == null ? 30 : Number(b.days);
+      assert(Number.isInteger(days) && days >= 1 && days <= 90, 'Elegí una vigencia de 1 a 90 días.');
+      const linkToken = randomToken(), expires = Date.now() + days * 86400000;
+      await db.batch([stmt(db, 'INSERT INTO statement_links(id,token_hash,client_id,created_by,created_at,expires_at) VALUES (?,?,?,?,?,?)', id(), await hash(linkToken), client.id, user.id, now(), expires), audit(db, user.id, 'statement_link.create', { client_id: client.id, days })]);
+      return json({ token: linkToken, expires_at: expires }, 201);
+    }
+    if (match[2] === 'payment-request' && method === 'POST') {
+      role(user, ['superadmin','admin','operator']);
+      assert(mpEnabled(env), 'Mercado Pago todavía no está configurado en este entorno.', 503);
+      const b = await body(request), amount = cents(b.amount); assert(amount > 0, 'Ingresá un importe mayor a cero.');
+      const requestId = id(), preference = await createMpPreference(env, url.origin, requestId, client, amount);
+      await db.batch([stmt(db, 'INSERT INTO payment_requests(id,client_id,amount,preference_id,checkout_url,note,created_by,created_at) VALUES (?,?,?,?,?,?,?,?)', requestId, client.id, amount, preference.id, preference.init_point, text(b.note, 200), user.id, now()), audit(db, user.id, 'payment_request.create', { id: requestId, client_id: client.id, amount })]);
+      return json({ id: requestId, checkout_url: preference.init_point }, 201);
     }
     if (match[2] === 'void' && method === 'POST') {
       role(user, ['superadmin','admin']);
@@ -380,7 +589,8 @@ async function api(request, env) {
       assert(charge, 'No se encontró el consumo original.', 404);
       assert(charge.remaining === charge.quantity * charge.unit_price, 'El consumo ya tiene pagos aplicados. Anulá primero esos pagos.', 409);
       const next = await buildCharge(db, user, client, b, JSON.parse(target.data).product_id);
-      await commitAccount(db, client, user, key, 'amend', { target_id: target.id, reason, before: JSON.parse(target.data), after: next }, requestHash, [
+      const overLimit = await checkDebtLimit(db, client, next.total - charge.remaining, b.confirm_over_limit);
+      await commitAccount(db, client, user, key, 'amend', { target_id: target.id, reason, before: JSON.parse(target.data), after: next, over_limit: overLimit || undefined }, requestHash, [
         stmt(db, 'UPDATE charges SET remaining=0 WHERE id=? AND remaining=quantity*unit_price', charge.id),
         stmt(db, 'INSERT INTO charges VALUES (?,?,?,?,?,?,?,?,?)', next.id, client.id, next.product_id, next.description, next.quantity, next.unit_price, next.total, next.occurred_on, key),
         stmt(db, 'INSERT INTO event_voids VALUES (?,?,?,?,?)', target.id, key, reason, user.id, now())
@@ -396,18 +606,25 @@ async function api(request, env) {
     }
     if (action === 'charge') {
       const charge = await buildCharge(db, user, client, b);
+      if (await checkDebtLimit(db, client, charge.total, b.confirm_over_limit)) charge.over_limit = true;
       await commitAccount(db, client, user, key, 'charge', charge, requestHash, [stmt(db, 'INSERT INTO charges VALUES (?,?,?,?,?,?,?,?,?)', charge.id, client.id, charge.product_id, charge.description, charge.quantity, charge.unit_price, charge.total, charge.occurred_on, key)]);
       return json({ ok: true });
     }
     if (action === 'quote' || action === 'payment') {
-      const lines = await pending(db, client.id), amount = cents(b.amount), mode = client.mode;
+      let lines = await pending(db, client.id);
+      const amount = cents(b.amount), mode = client.mode, manual = b.item_ids !== undefined && b.item_ids !== null;
+      if (manual) {
+        assert(Array.isArray(b.item_ids) && b.item_ids.length <= 500 && b.item_ids.every(x => typeof x === 'string'), 'Selección de ítems inválida.');
+        assert(b.item_ids.every(x => lines.some(l => l.id === x)), 'Alguno de los ítems elegidos ya no está pendiente. Volvé a calcular el cobro.', 409);
+        const chosen = new Set(b.item_ids); lines = lines.filter(l => chosen.has(l.id));
+      }
       assert(amount > 0 || client.credit > 0, 'Ingresá un importe o aplicá un saldo a favor.');
       assert(['Efectivo','Transferencia','Otro'].includes(b.method), 'Medio de pago inválido.');
       const quote = settlement(lines, amount, client.credit, mode);
       const fingerprint = await hash(JSON.stringify({ version: client.version, quote, method: b.method }));
       if (action === 'quote') return json({ ...quote, fingerprint, version: client.version });
       assert(b.fingerprint === fingerprint, 'La cuenta o los precios cambiaron. Volvé a calcular antes de cobrar.', 409);
-      const data = { ...quote, method: b.method, note: text(b.note, 500) };
+      const data = { ...quote, method: b.method, note: text(b.note, 500), manual: manual || undefined };
       await commitAccount(db, client, user, key, 'payment', data, requestHash, [
         stmt(db, `UPDATE charges SET remaining=(SELECT json_extract(value,'$.remaining') FROM json_each(?) WHERE json_extract(value,'$.id')=charges.id) WHERE client_id=? AND id IN (SELECT json_extract(value,'$.id') FROM json_each(?))`, JSON.stringify(quote.allocations), client.id, JSON.stringify(quote.allocations)),
         stmt(db, 'UPDATE clients SET credit=? WHERE id=?', quote.credit, client.id)
@@ -498,7 +715,7 @@ async function api(request, env) {
     ) x LEFT JOIN users u ON u.id=x.actor
     WHERE (?=1 OR (x.source='account' AND x.school_id IN (SELECT value FROM json_each(?)))) AND (? IS NULL OR x.action=?) AND (? IS NULL OR x.actor=?) AND (? IS NULL OR x.created_at>=?) AND (? IS NULL OR x.created_at<=?)
     ORDER BY x.created_at DESC,x.id LIMIT 50 OFFSET ?`,user.role==='superadmin'?1:0,user.school_ids,action,action,actor,actor,from&&`${from}T00:00:00.000Z`,from&&`${from}T00:00:00.000Z`,to&&`${to}T23:59:59.999Z`,to&&`${to}T23:59:59.999Z`,offset);
-    const extra=offset===0&&user.role==='superadmin'?{actions:(await rows(db,"SELECT action FROM audit UNION SELECT 'account.'||kind FROM events ORDER BY 1")).map(r=>r.action),actors:await rows(db,'SELECT id,name FROM users ORDER BY name')}:{};
+    const extra=offset===0&&user.role==='superadmin'?{actions:(await rows(db,"SELECT action FROM audit UNION SELECT 'account.'||kind FROM events ORDER BY 1")).map(r=>r.action),actors:await rows(db,"SELECT id,name FROM users WHERE id NOT LIKE 'system-%' ORDER BY name")}:{};
     return json({offset,rows:list.map(r=>({...r,data:JSON.parse(r.data)})),...extra});
   }
   if (path === '/api/products' && method === 'POST') {
@@ -542,7 +759,7 @@ async function api(request, env) {
   }
   if (path === '/api/users' && method === 'GET') {
     role(user, ['superadmin','admin']);
-    const list=await rows(db,'SELECT id,name,email,role,school_ids,active FROM users ORDER BY name');
+    const list=await rows(db,"SELECT id,name,email,role,school_ids,active FROM users WHERE id NOT LIKE 'system-%' ORDER BY name");
     return json(list.filter(u=>user.role==='superadmin'||(['operator','viewer'].includes(u.role)&&JSON.parse(u.school_ids).every(s=>JSON.parse(user.school_ids).includes(s)))));
   }
   if (path === '/api/users' && method === 'POST') {
@@ -588,7 +805,7 @@ export default {
     } catch (error) {
       console.error('request_failed', error.status || 500, error.status ? error.message : 'database_or_internal_error');
       const conflict = /UNIQUE constraint/.test(error.message);
-      response = json({ error: error.status ? error.message : conflict ? 'Ese registro ya existe. Actualizá la pantalla.' : 'No se pudo completar la operación. Revisá la configuración o intentá nuevamente.' }, error.status || (conflict ? 409 : 500));
+      response = json({ code: error.code, error: error.status ? error.message : conflict ? 'Ese registro ya existe. Actualizá la pantalla.' : 'No se pudo completar la operación. Revisá la configuración o intentá nuevamente.' }, error.status || (conflict ? 409 : 500));
     }
     response = new Response(response.body, response);
     response.headers.set('Cache-Control', new URL(request.url).pathname.startsWith('/api/') ? 'no-store' : 'no-cache');

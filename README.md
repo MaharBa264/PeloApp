@@ -1,12 +1,13 @@
 # PeloApp
 
-Cuentas corrientes para tres kioscos escolares. Interfaz luminosa adaptable a celular y PC. Versión **0.4.0 de piloto**, con anulación y modificación de consumos, productos archivables, proveedores con evolución de precios, auditoría y comparación de precios al adquirir y al pagar, anticipos, permisos por colegio e ingreso de documentos desde fotos como borradores revisables.
+Cuentas corrientes para tres kioscos escolares. Interfaz luminosa adaptable a celular y PC. Versión **0.5.0 de piloto**, con reporte de deudores, límites de deuda, recuperación de acceso, enlaces de estado de cuenta y base para Mercado Pago; anulación y modificación de consumos, productos archivables, proveedores con evolución de precios, auditoría y comparación de precios al adquirir y al pagar, anticipos, permisos por colegio e ingreso de documentos desde fotos como borradores revisables.
 
 ## Estado
 
 Código y configuración preparados para Cloudflare Workers + D1. La conexión del repositorio a Cloudflare, las migraciones remotas y la publicación deben verificarse en la cuenta del propietario. No hay datos ni credenciales reales en este repositorio.
 
 - [Configurar Cloudflare y crear el primer superadministrador](docs/CLOUDFLARE.md)
+- [Enlaces de estado de cuenta, WhatsApp, Mercado Pago y recuperación de acceso](docs/INTEGRACIONES.md)
 - [Alcance implementado, reglas monetarias y pendientes](docs/ALCANCE.md)
 - [Configurar Cloudflare R2 y probar carga de documentos](docs/CLOUDFLARE.md#almacenamiento-de-fotos-de-documentos)
 

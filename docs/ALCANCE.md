@@ -22,6 +22,11 @@ Cuentas corrientes de tres kioscos escolares. Interfaz luminosa adaptable a celu
 - Auditoría (superadministrador: todo; administrador: movimientos de cuentas de sus colegios) con filtros por acción, persona y fechas.
 - Fechas de consumo limitadas a 2020 hasta mañana; los colegios se validan contra la base de datos.
 - Aplicación instalable (service worker mínimo sin caché de datos) y archivos estáticos revalidados en vez de descargados siempre.
+- Recuperación de acceso: cambio de contraseña propio, enlace de recuperación de un solo uso emitido por un administrador y script para restablecer al superadministrador (ver `docs/INTEGRACIONES.md`).
+- Reporte de Deudores: total, top de deudores, antigüedad (0–30, 31–60, 61–90, +90 días), filtro por colegio y monto mínimo, exportación a CSV (Excel argentino) y a Excel (.xlsx).
+- Límite de deuda por cuenta: cargar un consumo que lo supere pide confirmación y queda registrado; se marca en la lista, en el detalle y en el reporte.
+- Pagos con selección manual de ítems a cancelar (o solo anticipo), además del orden más antiguo primero.
+- Enlace de estado de cuenta de solo lectura con botón para WhatsApp. Cobro con Mercado Pago desarrollado y desactivado hasta configurar credenciales (probado solo con una simulación).
 - Usuarios activos/inactivos y colegios asignados; personalización por superadministrador.
 - Resumen imprimible mediante navegador (también guardar PDF).
 
@@ -35,8 +40,8 @@ Al confirmar un cobro se emplea el precio revisado por el servidor; si la cuenta
 
 ## Pendientes para ampliar el piloto
 
-- Alumnos vinculados estructurados, selección manual de ítems a cancelar y límites de crédito.
-- Recuperación de acceso por correo (ya se puede restablecer contraseña desde Usuarios).
+- Alumnos vinculados estructurados y teléfono estructurado por cuenta.
+- Recuperación de acceso por correo electrónico (hoy: enlace generado por un administrador).
 - Cuentas de proveedores separadas de clientes y circuito compra/remito/factura/pago.
 - Exportaciones estructuradas, respaldos externos en Drive y reportes Sheets. No están conectados todavía.
 - Stock por recuentos libres; salidas estimadas conciliadas con consumos registrados, mermas y transferencias.
