@@ -214,7 +214,7 @@ async function publicStatementData(db, token) {
     school: { name: client.school_name, logo: client.school_logo, color: client.school_color },
     client: { name: client.name }, mode: client.mode, as_of: now(), expires_at: link.expires_at,
     due: client.mode === 'current' ? currentDueValue : originalDue, original_due: originalDue, credit: client.credit,
-    lines: lines.map(l => ({ description: l.description, quantity: l.quantity, occurred_on: l.occurred_on, unit_price: l.unit_price, remaining: l.remaining, current_value: l.current_value })),
+    lines: lines.map(l => ({ description: l.description, quantity: l.quantity, occurred_on: l.occurred_on, unit_price: client.mode === 'current' && l.current_price ? l.current_price : l.unit_price, remaining: l.remaining, current_value: l.current_value, partial: l.remaining < l.quantity * l.unit_price })),
     payments: payments.map(x => ({ date: x.created_at, amount: JSON.parse(x.data).received }))
   };
 }

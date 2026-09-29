@@ -208,3 +208,23 @@ test('reset-password script restores a locked-out superadmin', async () => {
   assert.throws(() => execFileSync('node', ['scripts/reset-password.mjs', 'admin@test.com'], { env: { ...process.env, NEW_PASSWORD: 'short' }, stdio: 'pipe' }));
   void call;
 });
+
+test('shared statement shows the current unit price and keeps the original one internal', async () => {
+  const { call, raw, key } = await setup();
+  await call('/products', 'POST', { name: 'Alfajor', price: '1000' });
+  const product = (await call('/data')).data.products[0];
+  const mkClient = async mode => (await call('/clients', 'POST', { name: `Cliente ${mode}`, kind: 'Familia', school_id: 'school-1', mode })).data.id;
+  const current = await mkClient('current'), original = await mkClient('original');
+  for (const id of [current, original]) await call(`/clients/${id}/charge`, 'POST', { product_id: product.id, quantity: 3, unit_price: '1000', occurred_on: isoDay(-7) }, key());
+  await call(`/products/${product.id}`, 'PUT', { price: '900' });
+  const view = async id => { const link = await call(`/clients/${id}/statement-link`, 'POST', {}); return (await raw(`/api/public/statement/${link.data.token}`, 'GET', null, { cookie: '' })).json(); };
+  const a = await view(current), b = await view(original);
+  assert.equal(a.lines[0].unit_price, 90000, 'price-at-payment account shows today\'s unit price');
+  assert.equal(a.due, 270000);
+  assert.equal(a.lines[0].unit_price * a.lines[0].quantity, a.due, 'unit price × units matches the amount owed');
+  assert.equal(b.lines[0].unit_price, 100000, 'original-price account shows the price it is charged at');
+  assert.equal(b.due, 300000);
+  assert.equal((await call(`/clients/${current}`)).data.lines[0].unit_price, 100000, 'internal data still keeps the original price');
+  await call(`/clients/${current}/charge`, 'POST', { description: 'Concepto libre', quantity: 1, unit_price: '500', occurred_on: isoDay(0) }, key());
+  assert.equal((await view(current)).lines.find(l => l.description === 'Concepto libre').unit_price, 50000, 'free concepts keep their amount');
+});
