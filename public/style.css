@@ -8,3 +8,11 @@
 
 .audit-json{white-space:pre-wrap;word-break:break-word;font-size:11px;max-width:60ch;max-height:240px;overflow:auto;background:var(--soft,#f3f5fb);padding:8px;border-radius:8px}.product-filters button{align-self:end}
 .content{min-width:0}.product-filters{flex-wrap:wrap}.audit-cell{max-width:440px;overflow-wrap:anywhere}
+a.button{display:inline-flex;align-items:center;justify-content:center;text-decoration:none;border-radius:11px;padding:12px 17px;font-weight:650;min-height:44px;background:var(--accent);color:#fff}
+a.button.secondary{background:#eef2f8;color:var(--ink)}
+.aging-bar{display:flex;height:22px;border-radius:8px;overflow:hidden;background:#eef2f8;margin:12px 0}
+.aging-legend{display:flex;flex-wrap:wrap;gap:8px 22px;font-size:13px;color:var(--muted)}
+.aging-legend i{display:inline-block;width:11px;height:11px;border-radius:3px;margin-right:6px;vertical-align:-1px}
+.statement{max-width:760px;margin:0 auto;padding:24px 16px 48px}
+.statement .lead{font-size:34px;font-weight:800;margin:6px 0}
+.card.pad + .card,.card + .card{margin-top:18px}
